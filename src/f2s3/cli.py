@@ -23,7 +23,8 @@ def main():
     parser.add_argument('--max_points_per_tile', type=int, default=argparse.SUPPRESS,
         help='Maximum number of points per each tile. Should be decreased if the program runs OOM.')
     parser.add_argument('--batch_size', type=int, default=argparse.SUPPRESS,
-        help='Batch size used in neural networks. Should be adapted depending on available virtual memory.')
+        help='Number of point patches pushed to the GPU per batch during local feature extraction '
+             '(default 10000). Increase to improve GPU occupancy, decrease if running OOM.')
 
     parser.add_argument('--voxel_grid_size', type=float, default=argparse.SUPPRESS,
         help='Target spacing for for voxel grid filter. Used to make the point density more uniform (No Filter if 0)')

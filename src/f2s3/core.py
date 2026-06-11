@@ -113,7 +113,7 @@ class F2S3RunSettings:
     start_from_tiled_data: bool = False
     tiled_data: Optional[Path] = None
     max_points_per_tile: int = 1000000
-    batch_size: int = 2000
+    batch_size: int = 10000
     voxel_grid_size: float = 0.0
     max_disp_magnitude: float = 0.0
     neighborhood_radius: float = 0.0
@@ -233,6 +233,7 @@ class PointCloudTile:
         self.base_save_path = args.results_dir
         self.voxel_grid_size = args.voxel_grid_size
         self.neighborhood_radius = args.neighborhood_radius
+        self.batch_size = args.batch_size
 
         # Compute median resolution of the point clouds
         self.median_resolution = self._compute_resolution()
@@ -313,9 +314,10 @@ class PointCloudTile:
                 f"Starting the computation of local feature descriptors. Neighborhood radius: {neighborhood_radius:.3f}")
 
         # Prepare source and target data loader.
-        # If running into the GPU memory problems reduce the number of points in a batch (default is 2000).
-        dataset_s = FeatureExtractionDataset(self.pcd_s, self.pcd_s_overlap, 1000, neighborhood_radius)
-        dataset_t = FeatureExtractionDataset(self.pcd_t, self.pcd_t_overlap, 1000, neighborhood_radius)
+        # Each item yields ``batch_size`` patches that are pushed to the GPU in one go (the DataLoader
+        # batch size stays 1). If running into GPU memory problems reduce ``--batch_size``.
+        dataset_s = FeatureExtractionDataset(self.pcd_s, self.pcd_s_overlap, self.batch_size, neighborhood_radius)
+        dataset_t = FeatureExtractionDataset(self.pcd_t, self.pcd_t_overlap, self.batch_size, neighborhood_radius)
 
         dataloader_s = torch.utils.data.DataLoader(dataset_s, batch_size=1, shuffle=False, num_workers=6,
                                                    drop_last=False)
