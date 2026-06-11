@@ -29,6 +29,9 @@ def main():
         help='Target spacing for for voxel grid filter. Used to make the point density more uniform (No Filter if 0)')
     parser.add_argument('--max_disp_magnitude', type=float, default=argparse.SUPPRESS,
         help='Maximum displacement magnitude, all points with higher magnitude will be filtered out (no filtering if 0)')
+    parser.add_argument('--neighborhood_radius', type=float, default=argparse.SUPPRESS,
+        help='Neighborhood radius for local feature extraction. Overrides the default '
+             'sqrt(3) * 10 * median_resolution (auto-derived if 0)')
     parser.add_argument(
         '--save_interim', action='store_true',
         help='Save interim results such as pointwise feature desriptors and supervoxels.')

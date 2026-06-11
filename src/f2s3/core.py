@@ -55,6 +55,7 @@ class F2S3RunSettings:
     batch_size: int = 2000
     voxel_grid_size: float = 0.0
     max_disp_magnitude: float = 0.0
+    neighborhood_radius: float = 0.0
     save_interim: bool = False
     verbose: bool = False
     filter_median_magnitude: bool = False
@@ -100,6 +101,8 @@ class F2S3RunSettings:
             raise ValueError("Voxel grid size can't be negative!")
         if self.max_disp_magnitude < 0.0:
             raise ValueError("Maximum displacement magnitude can't be negative!")
+        if self.neighborhood_radius < 0.0:
+            raise ValueError("Neighborhood radius can't be negative!")
 
 
         # Prepare the logger
@@ -168,6 +171,7 @@ class PointCloudTile:
         self.save_interim = args.save_interim
         self.base_save_path = args.results_dir
         self.voxel_grid_size = args.voxel_grid_size
+        self.neighborhood_radius = args.neighborhood_radius
 
         # Compute median resolution of the point clouds
         self.median_resolution = self._compute_resolution()
@@ -237,7 +241,11 @@ class PointCloudTile:
         [3] Poiesi, F., & Boscaini, D.: Distinctive 3D local deep descriptors. International Conference on Pattern Recognition (ICPR), 2020.
         """
 
-        neighborhood_radius = np.sqrt(3) * (10 * self.median_resolution)
+        # Use the user-defined neighborhood radius if provided, otherwise derive it from the median resolution
+        if self.neighborhood_radius > 0.0:
+            neighborhood_radius = self.neighborhood_radius
+        else:
+            neighborhood_radius = np.sqrt(3) * (10 * self.median_resolution)
 
         if self.verbose:
             logging.info(
