@@ -374,8 +374,8 @@ class PointCloudTile:
             # Build one GPU index per overlap cloud (D-03/EXT-04)
             s_overlap_np = np.asarray(self.pcd_s_overlap.points).astype(np.float32)
             t_overlap_np = np.asarray(self.pcd_t_overlap.points).astype(np.float32)
-            gpu_idx_s = gpu_extract.build_index(s_overlap_np)
-            gpu_idx_t = gpu_extract.build_index(t_overlap_np)
+            gpu_idx_s = gpu_extract.build_index(s_overlap_np, neighborhood_radius)
+            gpu_idx_t = gpu_extract.build_index(t_overlap_np, neighborhood_radius)
 
             # GPU resolution estimate (EXT-04 reuse)
             s_query_np = np.asarray(self.pcd_s.points).astype(np.float32)

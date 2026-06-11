@@ -14,18 +14,21 @@ class GpuNeighborIndex:
     scattering inside `radius_neighborhoods`.
     """
 
-    __slots__ = ("nns", "positions")
+    __slots__ = ("nns", "positions", "_radius_index_built")
 
-    def __init__(self, nns, positions):
+    def __init__(self, nns, positions, radius_index_built=False):
         self.nns = nns
-        self.positions = positions  # [N, 3] float32 torch tensor on CUDA
+        self.positions = positions
+        self._radius_index_built = radius_index_built
 
 
-def build_index(overlap_positions):
+def build_index(overlap_positions, feature_radius=None):
     """Build a GPU NearestNeighborSearch index over the overlap cloud.
 
     Args:
         overlap_positions: (N, 3) float32 numpy array of overlap-cloud points.
+        feature_radius: If given, pre-build the fixed_radius_index too so
+            ``radius_neighborhoods`` skips the rebuild per chunk.
 
     Returns:
         ``GpuNeighborIndex`` whose ``.nns`` is the Open3D index and
@@ -37,8 +40,12 @@ def build_index(overlap_positions):
     )
     nns = o3d.core.nns.NearestNeighborSearch(pos)
     nns.knn_index()
+    radius_built = False
+    if feature_radius is not None:
+        nns.fixed_radius_index(feature_radius)
+        radius_built = True
     positions = from_dlpack(pos.to_dlpack())
-    return GpuNeighborIndex(nns, positions)
+    return GpuNeighborIndex(nns, positions, radius_index_built=radius_built)
 
 
 def gpu_resolution(gpu_index, query_positions):
@@ -92,12 +99,14 @@ def radius_neighborhoods(gpu_index, query_positions, feature_radius):
         - ptall_mask    [Q, maxN_all]     bool
     """
     nns = gpu_index.nns
+    if not gpu_index._radius_index_built:
+        nns.fixed_radius_index(feature_radius)
+        gpu_index._radius_index_built = True
     dev = o3c.Device("CUDA:0")
     q = o3c.Tensor(
         query_positions.astype(np.float32).copy(), dtype=o3c.float32, device=dev
     )
 
-    nns.fixed_radius_index(feature_radius)
     idx, dist, splits = nns.fixed_radius_search(q, feature_radius)
 
     t_idx = from_dlpack(idx.to_dlpack()).long()
@@ -273,10 +282,9 @@ def gpu_extract_features(
 
     # VRAM-bound chunk size: radius_neighborhoods produces [chunk, maxN, 3]
     # float32 tensors; with maxN up to ~2000 on the _small pair at
-    # r≈2.96, a chunk of 20000 points needs ~20000*2000*3*4 = 480 MB.
-    # Two such sets (ptnn + ptall) + NNS scratch ~= 2 GB/chunk.
-    # Twenty-four GB / 2 GB → safe at 10000 chunks (verified on 3090 Ti).
-    CHUNK_SIZE = 10000
+    # r≈2.96.  Observed ~5.5 GB VRAM at 10 K chunks — 60 K keeps
+    # well under 24 GB (~12 GB estimated) and reduces chunk count 6×.
+    CHUNK_SIZE = 60000
 
     local_features = []
     for chunk_start in range(0, Q, CHUNK_SIZE):
