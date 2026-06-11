@@ -44,6 +44,67 @@ from .utils import transform_point_cloud, compute_c2c
 from pc_tiling import pc_tiling
 from supervoxel import supervoxel
 
+
+def _radius_from_resolution(median_resolution):
+    """
+    Local-feature search (neighborhood) radius derived from the median point cloud resolution.
+
+    Args:
+        median_resolution (float): median distance to the closest point.
+
+    Returns:
+        float: search radius used for the local feature descriptors.
+    """
+    return np.sqrt(3) * (10 * median_resolution)
+
+
+def _median_nn_resolution(pcd_s, pcd_t, verbose=False, max_query_points=None):
+    """
+    Median point cloud resolution across the source and target clouds, where resolution is the
+    median distance to the nearest neighbor. Returns the larger (coarser) of the two medians.
+
+    For large clouds the nearest-neighbor distances can be evaluated on a random subset of query
+    points (searched against the full cloud) by setting ``max_query_points``. This keeps the estimate
+    unbiased - unlike subsampling the cloud itself - while bounding the runtime.
+
+    Args:
+        pcd_s (open3d.geometry.PointCloud): source point cloud.
+        pcd_t (open3d.geometry.PointCloud): target point cloud.
+        verbose (bool): log the computation time.
+        max_query_points (int | None): if set, evaluate the resolution on at most this many randomly
+            chosen query points per cloud. ``None`` uses every point (original behavior).
+
+    Returns:
+        float: median point cloud resolution (max of the source and target medians).
+    """
+
+    def _resolution(pcd):
+        pts = np.asarray(pcd.points)
+        # k=2 as the closest point is the point itself
+        neigh = NearestNeighbors(n_neighbors=2, algorithm='kd_tree')
+        neigh.fit(pts)
+
+        if max_query_points is not None and pts.shape[0] > max_query_points:
+            query = pts[np.random.choice(pts.shape[0], max_query_points, replace=False)]
+        else:
+            query = pts
+
+        dist01, _ = neigh.kneighbors(query, return_distance=True)
+        return np.median(dist01[:, -1])
+
+    start_time = time.time()
+
+    resolution_s = _resolution(pcd_s)
+    resolution_t = _resolution(pcd_t)
+
+    if verbose:
+        logging.info(
+            'Median point cloud resolution computed in: {:.2f} s'.format(time.time() - start_time))
+
+    # Lower of the both point cloud resolutions (i.e. larger median distance to the closest points)
+    return max(resolution_s, resolution_t)
+
+
 @dataclass
 class F2S3RunSettings:
     results_dir: Path
@@ -189,7 +250,7 @@ class PointCloudTile:
         # Approximate supervoxel radius is defined for each tile independently based on the median point cloud resolution
         # I changes please consider that this has to be a reasonable value (i.e. size of the patch that moves as rigid body)
 
-        supervoxel_radius = np.max((np.sqrt(3) * (10 * self.median_resolution), self.voxel_grid_size,))
+        supervoxel_radius = np.max((_radius_from_resolution(self.median_resolution), self.voxel_grid_size,))
 
         if self.verbose:
             logging.info('Starting the supervoxel ectraction.')
@@ -245,7 +306,7 @@ class PointCloudTile:
         if self.neighborhood_radius > 0.0:
             neighborhood_radius = self.neighborhood_radius
         else:
-            neighborhood_radius = np.sqrt(3) * (10 * self.median_resolution)
+            neighborhood_radius = _radius_from_resolution(self.median_resolution)
 
         if self.verbose:
             logging.info(
@@ -307,8 +368,8 @@ class PointCloudTile:
             if not os.path.exists(save_path):
                 os.makedirs(save_path)
 
-            np.savez(os.path.join(save_path, 'features_tile_{}_{:.1f}.npz'.format(self.tile_id, np.sqrt(3) * (
-                        10 * self.median_resolution))),
+            np.savez(os.path.join(save_path, 'features_tile_{}_{:.1f}.npz'.format(
+                        self.tile_id, _radius_from_resolution(self.median_resolution))),
                      feat_s=self.local_features_s.cpu(), feat_t=self.local_features_t.cpu())
 
     def compute_correspondences(self):
@@ -513,33 +574,7 @@ class PointCloudTile:
 
         """
 
-        start_time = time.time()
-        # Compute the point cloud resolution of the source point cloud (k=2 as the closest point is the point itself)
-        neigh = NearestNeighbors(n_neighbors=2, algorithm='kd_tree')
-        neigh.fit(np.array(self.pcd_s.points))
-        dist01, _ = neigh.kneighbors(np.array(self.pcd_s.points), return_distance=True)
-
-        # Resolution of the source point cloud
-        resolution_s = np.median(dist01[:, -1])
-
-        # Compute the point cloud resolution of the target point cloud (k=2 as the closest point is the point itself)
-        neigh.fit(np.array(self.pcd_t.points))
-        dist01, _ = neigh.kneighbors(np.array(self.pcd_t.points), return_distance=True)
-
-        # Resolution of the target point cloud
-        resolution_t = np.median(dist01[:, -1])
-
-        end_time = time.time()
-
-        if self.verbose:
-            logging.info(
-                'Median point cloud resolution of the tiles computed in: {:.2f} s'.format(end_time - start_time))
-
-        # Lower of the both point cloud resolutions (i.e. larger median distance to the closest points)
-
-        pc_resolution = max(resolution_s, resolution_t)
-
-        return pc_resolution
+        return _median_nn_resolution(self.pcd_s, self.pcd_t, self.verbose)
 
 
 def feature_based_deformation_analysis(args: F2S3RunSettings):
@@ -576,6 +611,29 @@ def feature_based_deformation_analysis(args: F2S3RunSettings):
         #                              args.target_cloud,
         #                              args.verbose)
 
+        # The tiles need to overlap by at least the local-feature search radius, so that every point
+        # in a tile keeps a complete neighborhood (the search tree is built on the overlap cloud).
+        # The overlap is therefore tied to that radius: either the user-defined value or, in the
+        # automatic case, derived from a global median resolution estimated on the full clouds before
+        # tiling (the per-tile resolution is not yet available at this stage).
+        if args.neighborhood_radius > 0.0:
+            tile_overlap = args.neighborhood_radius
+            if args.verbose:
+                logging.info(
+                    f'Using the user-defined neighborhood radius as tile overlap: {tile_overlap:.3f} m')
+        else:
+            pcd_s_full = o3d.io.read_point_cloud(str(args.source_cloud))
+            pcd_t_full = o3d.io.read_point_cloud(str(args.target_cloud))
+            global_resolution = _median_nn_resolution(
+                pcd_s_full, pcd_t_full, args.verbose, max_query_points=100000)
+            tile_overlap = _radius_from_resolution(global_resolution)
+            del pcd_s_full, pcd_t_full
+            gc.collect()
+            if args.verbose:
+                logging.info(
+                    f'Derived tile overlap from global median resolution ({global_resolution:.4f} m): '
+                    f'{tile_overlap:.3f} m')
+
         # Tile the point cloud into smaller tiles that can be processed on a standalone computer
         pc_tiling.tile_point_clouds(str(args.source_cloud),
                                     str(args.target_cloud),
@@ -584,7 +642,7 @@ def feature_based_deformation_analysis(args: F2S3RunSettings):
                                     10000,
                                     bool(args.voxel_grid_size),
                                     args.voxel_grid_size,
-                                    0.0,
+                                    tile_overlap,
                                     -1,
                                     args.verbose)
 
