@@ -94,7 +94,7 @@ Notes: Lowest-effort, lowest-risk tier (XS items) — done first. Re-profile aft
 
 **Wave 2** *(blocked on Wave 1)*
 
-- [ ] 03-03-PLAN.md — Masked batched eigh LRF + seeded vectorized subsample (parity-grade) (EXT-02, EXT-03)
+- [x] 03-03-PLAN.md — Masked batched eigh LRF + seeded vectorized subsample (parity-grade) (EXT-02, EXT-03)
 
 **Wave 3** *(blocked on Wave 2)*
 
@@ -178,7 +178,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7
 |-------|----------------|--------|-----------|
 | 1. Baseline, Parity & Profiling Harness | 3/3 | Complete    | 2026-06-11 |
 | 2. Quick Wins / Ampere Utilization | 0/TBD | Not started | - |
-| 3. GPU-Native Patch Extraction | 2/4 | In Progress|  |
+| 3. GPU-Native Patch Extraction | 3/4 | In Progress|  |
 | 4. Batched Supervoxel Filtering | 0/TBD | Not started | - |
 | 5. Correspondence Search / GPU ANN | 0/TBD | Not started | - |
 | 6. I/O & Orchestration | 0/TBD | Not started | - |
