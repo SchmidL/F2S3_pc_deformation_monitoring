@@ -296,10 +296,14 @@ def gpu_extract_features(
         patches_256 = subsample_256(patches, seed)
 
         # Feed through descriptor model in batches
+        # Feed through descriptor model in batches
+        # feature_extractor expects [B, 3, 256] (channels-first), but
+        # subsample_256 returns [Q, 256, 3] (points-first).  Transpose.
         chunk_Q = chunk_end - chunk_start
         for start in range(0, chunk_Q, batch_size):
             end = min(start + batch_size, chunk_Q)
-            batch_patches = patches_256[start:end, :, :]
+            batch_patches = patches_256[start:end, :, :]  # [B, 256, 3]
+            batch_patches = batch_patches.transpose(1, 2)  # → [B, 3, 256]
             batch_feat, _, _ = feature_extractor(batch_patches)
             local_features.append(batch_feat)
 
