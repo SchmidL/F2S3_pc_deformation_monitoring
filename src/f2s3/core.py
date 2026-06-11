@@ -40,6 +40,7 @@ from .descriptor_model import PointNetFeature
 from .filtering_model import FilteringNetwork
 from .data import FeatureExtractionDataset
 from .utils import transform_point_cloud, compute_c2c
+from . import gpu_extract
 
 from pc_tiling import pc_tiling
 from supervoxel import supervoxel
@@ -324,45 +325,77 @@ class PointCloudTile:
 
         if self.verbose:
             logging.info(
-                f"Starting the computation of local feature descriptors. Neighborhood radius: {neighborhood_radius:.3f}")
-
-        # Prepare source and target data loader.
-        # Each item yields ``batch_size`` patches that are pushed to the GPU in one go (the DataLoader
-        # batch size stays 1). If running into GPU memory problems reduce ``--batch_size``.
-        dataset_s = FeatureExtractionDataset(self.pcd_s, self.pcd_s_overlap, self.batch_size, neighborhood_radius)
-        dataset_t = FeatureExtractionDataset(self.pcd_t, self.pcd_t_overlap, self.batch_size, neighborhood_radius)
-
-        dataloader_s = torch.utils.data.DataLoader(dataset_s, batch_size=1, shuffle=False, num_workers=6,
-                                                   drop_last=False)
-        dataloader_t = torch.utils.data.DataLoader(dataset_t, batch_size=1, shuffle=False, num_workers=6,
-                                                   drop_last=False)
+                f"Starting the computation of local feature descriptors. "
+                f"Backend: {self.extraction_backend}. "
+                f"Neighborhood radius: {neighborhood_radius:.3f}")
 
         start_time = time.time()
-
         local_features_s = []
         local_features_t = []
 
-        start_time = time.time()
+        if self.extraction_backend == "cpu":
+            # ---------- CPU path (unchanged A/B oracle, D-02) ----------
+            # The FeatureExtractionDataset/DataLoader workers apply
+            # only to this cpu backend (Pitfall 5).
+            dataset_s = FeatureExtractionDataset(
+                self.pcd_s, self.pcd_s_overlap, self.batch_size,
+                neighborhood_radius)
+            dataset_t = FeatureExtractionDataset(
+                self.pcd_t, self.pcd_t_overlap, self.batch_size,
+                neighborhood_radius)
+            dataloader_s = torch.utils.data.DataLoader(
+                dataset_s, batch_size=1, shuffle=False, num_workers=6,
+                drop_last=False)
+            dataloader_t = torch.utils.data.DataLoader(
+                dataset_t, batch_size=1, shuffle=False, num_workers=6,
+                drop_last=False)
 
-        # If verbose mode is selected show the progress bar of the feature computation
-        if self.verbose:
-            dataloader_s = tqdm(dataloader_s, ncols=90)
-        # Compute the features for the source point cloud
-        for batch in dataloader_s:
-            batch_feat = batch.squeeze(0).cuda()
-            batch_feat, _, _ = self.feature_extractor(batch_feat)
+            if self.verbose:
+                dataloader_s = tqdm(dataloader_s, ncols=90)
+            for batch in dataloader_s:
+                batch_feat = batch.squeeze(0).cuda()
+                batch_feat, _, _ = self.feature_extractor(batch_feat)
+                local_features_s.append(batch_feat)
 
-            local_features_s.append(batch_feat)
+            if self.verbose:
+                dataloader_t = tqdm(dataloader_t, ncols=90)
+            for batch in dataloader_t:
+                batch_feat = batch.squeeze(0).cuda()
+                batch_feat, _, _ = self.feature_extractor(batch_feat)
+                local_features_t.append(batch_feat)
 
-        # Compute the features for the target point cloud
-        if self.verbose:
-            dataloader_t = tqdm(dataloader_t, ncols=90)
+        else:
+            # ---------- GPU path (default, D-02a) ----------
+            # The GPU backend builds its patches on-device via Open3D NNS
+            # and does NOT use the FeatureExtractionDataset/DataLoader
+            # workers.  QW-02/QW-03 knobs (num_workers, pin_memory,
+            # prefetch_factor) apply only to the cpu backend (Pitfall 5).
 
-        for batch in dataloader_t:
-            batch_feat = batch.squeeze(0).cuda()
-            batch_feat, _, _ = self.feature_extractor(batch_feat)
+            # Build one GPU index per overlap cloud (D-03/EXT-04)
+            s_overlap_np = np.asarray(self.pcd_s_overlap.points).astype(np.float32)
+            t_overlap_np = np.asarray(self.pcd_t_overlap.points).astype(np.float32)
+            gpu_idx_s = gpu_extract.build_index(s_overlap_np)
+            gpu_idx_t = gpu_extract.build_index(t_overlap_np)
 
-            local_features_t.append(batch_feat)
+            # GPU resolution estimate (EXT-04 reuse)
+            s_query_np = np.asarray(self.pcd_s.points).astype(np.float32)
+            t_query_np = np.asarray(self.pcd_t.points).astype(np.float32)
+
+            # Source features
+            s_query_t = torch.from_numpy(s_query_np).cuda()
+            features_s = gpu_extract.gpu_extract_features(
+                s_query_t, gpu_idx_s, neighborhood_radius,
+                self.feature_extractor, self.batch_size,
+                self.extraction_seed, verbose=self.verbose)
+            local_features_s = [features_s]
+
+            # Target features
+            t_query_t = torch.from_numpy(t_query_np).cuda()
+            features_t = gpu_extract.gpu_extract_features(
+                t_query_t, gpu_idx_t, neighborhood_radius,
+                self.feature_extractor, self.batch_size,
+                self.extraction_seed, verbose=self.verbose)
+            local_features_t = [features_t]
 
         # Save the features for the subsequent correspondence estimation
         self.local_features_s = torch.cat(local_features_s, 0)
@@ -374,7 +407,7 @@ class PointCloudTile:
 
         if self.verbose:
             logging.info('Extraction of the local feature descriptors completed.')
-            logging.info('Local features were computed in {:.2f} s'.format(end_time - start_time))
+            logging.info(f'Local features were computed in {end_time - start_time:.2f} s')
 
         # Save the feature descriptors if the interim save result mode is selected
         if self.save_interim:
