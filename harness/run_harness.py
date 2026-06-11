@@ -45,6 +45,8 @@ def run_pipeline(
     verbose: bool = True,
     seed: Optional[int] = None,
     log_lines: Optional[list] = None,
+    extraction_backend: str = "gpu",
+    extraction_seed: int = 41,
 ) -> None:
     """Run the real F2S3 pipeline in-process on a single tile-pair.
 
@@ -66,6 +68,10 @@ def run_pipeline(
             timing harvest).  The capture handler is installed *after*
             ``F2S3RunSettings`` configures logging so it survives
             ``coloredlogs.install()``.
+        extraction_backend: "gpu" (default) or "cpu" — selects the
+            feature-extraction backend (D-02, Phase 3 flag).
+        extraction_seed: int seed for the GPU subsample (D-04,
+            deterministic by default at 41).
     """
     if seed is not None:
         import numpy as np
@@ -81,6 +87,8 @@ def run_pipeline(
         target_cloud=Path(target),
         save_interim=save_interim,
         verbose=verbose,
+        extraction_backend=extraction_backend,
+        extraction_seed=extraction_seed,
     )
 
     # Install log-capture handler AFTER coloredlogs.install() so it
@@ -166,6 +174,21 @@ def _add_capture_subparser(subparsers) -> None:
         default=None,
         help="Opt-in deterministic seed for numpy+torch RNGs (D-09, OFF by default).",
     )
+    parser_capture.add_argument(
+        "--extraction-backend",
+        type=str,
+        default="gpu",
+        choices=["cpu", "gpu"],
+        help="Extraction backend: cpu (A/B oracle) or gpu (default). "
+             "Phase 3 flag — the harness capture runs the selected backend.",
+    )
+    parser_capture.add_argument(
+        "--extraction-seed",
+        type=int,
+        default=41,
+        help="Seed for the GPU subsample (default 41, D-04). "
+             "Both sides of the EXT-05 A/B must use the SAME seed.",
+    )
     parser_capture.set_defaults(func=_cmd_capture)
 
 
@@ -173,12 +196,16 @@ def _cmd_capture(args) -> None:
     """Execute the capture subcommand."""
     out_dir: Path = args.out
     seed: Optional[int] = args.seed
+    extraction_backend: str = args.extraction_backend
+    extraction_seed: int = args.extraction_seed
 
     logging.info(f"Capture: baseline -> {out_dir.resolve()}")
     logging.info(f"  source: {SMALL_S}")
     logging.info(f"  target: {SMALL_T}")
     if seed is not None:
         logging.info(f"  seed:   {seed}")
+    logging.info(f"  extraction-backend: {extraction_backend}")
+    logging.info(f"  extraction-seed:    {extraction_seed}")
 
     # Capture per-stage --verbose log lines for HARN-03 timing harvest.
     log_lines: list = []
@@ -191,6 +218,8 @@ def _cmd_capture(args) -> None:
         verbose=True,        # required for per-stage timing logs (HARN-03)
         seed=seed,
         log_lines=log_lines,
+        extraction_backend=extraction_backend,
+        extraction_seed=extraction_seed,
     )
 
     _record_env_json(out_dir)
