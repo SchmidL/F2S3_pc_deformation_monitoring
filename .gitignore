@@ -717,3 +717,9 @@ FodyWeavers.xsd
 
 # Built Visual Studio Code Extensions
 *.vsix
+
+# GSD planning docs (local-only)
+.planning/
+
+# F2S3 harness regenerable baseline artifacts
+baseline/
