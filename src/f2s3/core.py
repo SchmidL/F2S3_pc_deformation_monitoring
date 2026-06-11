@@ -590,6 +590,13 @@ def feature_based_deformation_analysis(args: F2S3RunSettings):
 
     start_time_whole_analysis = time.time()
 
+    # Enable Ampere (and newer) tensor-core math for the conv1d/linear-heavy descriptor and filter
+    # networks. TF32 gives a solid speedup with negligible accuracy change; cudnn.benchmark autotunes
+    # convolution kernels for the (fixed) patch shapes used during feature extraction.
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    torch.backends.cudnn.benchmark = True
+
     with resources.path('f2s3.pretrained_models.feature_descriptor', 'model_best.pth') as f_m:
         f_m = Path(f_m)
     with resources.path('f2s3.pretrained_models.outlier_filtering', 'model_best.pt') as o_m:
