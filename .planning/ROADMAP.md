@@ -90,7 +90,7 @@ Notes: Lowest-effort, lowest-risk tier (XS items) — done first. Re-profile aft
 
 **Wave 1** *(blocked on Wave 0)*
 
-- [ ] 03-02-PLAN.md — GPU index per cloud + radius search -> padded coords + mask, wired end-to-end behind extraction_backend=gpu (EXT-01, EXT-04)
+- [x] 03-02-PLAN.md — GPU index per cloud + radius search -> padded coords + mask, wired end-to-end behind extraction_backend=gpu (EXT-01, EXT-04)
 
 **Wave 2** *(blocked on Wave 1)*
 
@@ -178,7 +178,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7
 |-------|----------------|--------|-----------|
 | 1. Baseline, Parity & Profiling Harness | 3/3 | Complete    | 2026-06-11 |
 | 2. Quick Wins / Ampere Utilization | 0/TBD | Not started | - |
-| 3. GPU-Native Patch Extraction | 1/4 | In Progress|  |
+| 3. GPU-Native Patch Extraction | 2/4 | In Progress|  |
 | 4. Batched Supervoxel Filtering | 0/TBD | Not started | - |
 | 5. Correspondence Search / GPU ANN | 0/TBD | Not started | - |
 | 6. I/O & Orchestration | 0/TBD | Not started | - |
