@@ -221,6 +221,8 @@ def test_subsample_seeded():
     import f2s3.gpu_extract as gpu  # noqa: F811
     from f2s3.gpu_extract import build_index, radius_neighborhoods, subsample_seeded
 
+    import torch
+
     overlap_pts = pts.astype(np.float32)
     index = build_index(overlap_pts)
     _, _, _, ptall_coords, ptall_mask = radius_neighborhoods(

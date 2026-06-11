@@ -107,6 +107,9 @@ def radius_neighborhoods(gpu_index, query_positions, feature_radius):
     counts = t_splits[1:] - t_splits[:-1]
     Q = int(counts.shape[0])
 
+    # Center query points for relative coords
+    q_t = from_dlpack(q.to_dlpack())  # [Q, 3] float32, cuda
+
     def _pad_results(keep_first):
         """Pad ragged CSR into [Q, maxN, 3] coords + [Q, maxN] mask + dist."""
         if keep_first:
@@ -145,7 +148,7 @@ def radius_neighborhoods(gpu_index, query_positions, feature_radius):
             for s, n in zip(nz_start, nz_c)
         ])
 
-        coords[q_rep, col_rep] = overlap[t_idx[src_rep]]
+        coords[q_rep, col_rep] = overlap[t_idx[src_rep]] - q_t[q_rep]
         sqrt_dist[q_rep, col_rep] = t_dist[src_rep].sqrt()
         return coords, mask, sqrt_dist
 
@@ -165,16 +168,90 @@ def _empty_mask(Q):
     return torch.zeros(Q, 0, dtype=torch.bool, device="cuda:0")
 
 
+def batched_lrf(ptnn_coords, ptnn_mask, ptnn_sqrt_dist, ptall_coords,
+                ptall_mask, q_pt, feature_radius):
+    """Masked batched ``torch.linalg.eigh`` LRF (eqs. 3–5).
+
+    Computes a 3×3 covariance over the **nearest-dropped** ``ptnn`` set
+    (mirroring CPU ``points[patch_idx[1:]]`` / ``patch_dist[1:]``),
+    holds the vectorized eq. 4 sign disambiguation and eq. 5 in-plane
+    axis, then rotates the **full** ``ptall`` set (mirroring CPU
+    ``points[patch_idx]``, index 0 kept) into the LRF.
+
+    Args:
+        ptnn_coords:   [Q, maxN_nn, 3]   neighbour coords (nearest dropped)
+        ptnn_mask:     [Q, maxN_nn]      bool validity mask
+        ptnn_sqrt_dist: [Q, maxN_nn]     sqrt squared distance
+        ptall_coords:  [Q, maxN_all, 3]  full-in-radius coords (nearest kept)
+        ptall_mask:    [Q, maxN_all]     bool validity mask
+        q_pt:          [Q, 3]            query-point positions
+        feature_radius: float
+
+    Returns:
+        patches: [Q, maxN_all, 3]   rotated by lRg, divided by feature_radius
+    """
+    zp, xp, yp = _lrf_core(ptnn_coords, ptnn_mask, ptnn_sqrt_dist, feature_radius)
+
+    n_ptall = ptall_mask.sum(dim=1)
+
+    # Build lRg per query: [Q, 3, 3] as [xp, yp, zp]^T
+    lRg = torch.stack([xp, yp, zp], dim=2)
+
+    # Rotate the FULL ptall set into the LRF (coords already centered)
+    ptall_rot = torch.bmm(lRg.transpose(1, 2), ptall_coords.transpose(1, 2))
+    ptall_rot = ptall_rot.transpose(1, 2) / feature_radius
+
+    # >10-neighbor branch: <=10 → skip rotation (CPU else-branch)
+    few_mask = n_ptall <= 10
+    no_lrf = ptall_coords / feature_radius
+    result = torch.where(few_mask[:, None, None], no_lrf, ptall_rot)
+    result = result * ptall_mask[..., None]
+
+    return result, zp, xp, yp
+
+
+def subsample_256(patches, seed):
+    """Seeded vectorised 256-point subsample without replacement.
+
+    Reproduces ``np.random.choice(replace=False)`` over a zero-padded
+    array (zero rows are eligible, D-05).  Deterministic by default
+    (D-04) — a local ``torch.Generator`` is seeded from ``seed``.
+
+    Args:
+        patches: [Q, P, 3] float32 tensor (already rotated + normalised,
+                 may be zero-padded to ≥ 256 rows).
+        seed: int for the local Generator.
+
+    Returns:
+        selected: [Q, 256, 3] float32 tensor (deterministic for same seed).
+    """
+    P = patches.shape[1]
+    device = patches.device
+
+    # Pad to at least 256 if narrower (D-05 sparse regime)
+    if P < 256:
+        z = torch.zeros(patches.shape[0], 256 - P, 3, dtype=patches.dtype,
+                        device=device)
+        patches = torch.cat([patches, z], dim=1)
+        P = 256
+
+    g = torch.Generator(device=device).manual_seed(seed)
+    keys = torch.rand(patches.shape[0], P, generator=g, device=device)
+    perm = keys.argsort(dim=1)[:, :256]
+    selected = torch.gather(patches, 1,
+                            perm[..., None].expand(-1, -1, 3))
+    return selected
+
+
 def gpu_extract_features(
     query_pts_t, gpu_index, feature_radius, feature_extractor,
     batch_size, seed, verbose=False
 ):
-    """Thin end-to-end GPU extraction returning (B, 3, 256) patch tensor.
+    """End-to-end GPU extraction returning (Q, feat_dim) local features.
 
-    This is a placeholder LRF/subsample path for plan 03-02: it runs
-    the radius search on-device but uses an identity LRF + uniform
-    subsample so the slice runs end-to-end.  Parity-grade LRF and
-    seeded subsample are 03-03's job.
+    Runs the full parity-grade pipeline: radius search → batched masked
+    ``eigh`` LRF (eqs. 3–5) → seeded vectorised subsample (256 points) →
+    descriptor model forward.
 
     Args:
         query_pts_t: (Q, 3) float32 torch tensor on CUDA.
@@ -182,7 +259,7 @@ def gpu_extract_features(
         feature_radius: float, search radius.
         feature_extractor: PointNetFeature model in eval mode (on CUDA).
         batch_size: int, batch size fed to the descriptor model.
-        seed: int, seed for subsample determinism (respected in 03-03).
+        seed: int, seed for subsample determinism.
         verbose: bool.
 
     Returns:
@@ -190,42 +267,118 @@ def gpu_extract_features(
     """
     Q = query_pts_t.shape[0]
     if Q == 0:
-        return torch.zeros(0, feature_extractor.final_mlp[-1].out_features
-                           if hasattr(feature_extractor, 'final_mlp')
-                           else 64, device=query_pts_t.device)
+        return torch.zeros(0, 64, device=query_pts_t.device)
 
     query_np = query_pts_t.cpu().numpy().astype(np.float32)
-    _, _, _, ptall_coords, ptall_mask = radius_neighborhoods(
-        gpu_index, query_np, feature_radius
+    ptnn_coords, ptnn_mask, ptnn_sqrt_dist, ptall_coords, ptall_mask = (
+        radius_neighborhoods(gpu_index, query_np, feature_radius)
     )
-    # ptall_coords: [Q, maxN_all, 3], ptall_mask: [Q, maxN_all]
-    max_nn = ptall_coords.shape[1]
 
-    # Thin subsample: take first 256 real neighbours + pad with zeros
-    n_real = ptall_mask.sum(dim=1).long()
-    patches = torch.zeros(Q, 256, 3, dtype=torch.float32, device=ptall_coords.device)
-    for i in range(min(Q, 256)):  # safety cap — full vectorize in 03-03
-        n = int(min(n_real[i].item(), 256))
-        if n > 0:
-            patches[i, :n] = ptall_coords[i, :n]
-        # remainder stays zero (D-05 zero-pad)
+    # Parity-grade batched LRF (eqs. 3-5)
+    patches, _, _, _ = batched_lrf(
+        ptnn_coords, ptnn_mask, ptnn_sqrt_dist, ptall_coords, ptall_mask,
+        query_pts_t, feature_radius
+    )
 
-    # Normalise by feature_radius (unchanged scale contract)
-    patches = patches / feature_radius
+    # Seeded vectorised 256-point subsample
+    patches_256 = subsample_256(patches, seed)
 
     # Feed through descriptor model in batches
-    feat_dim = 64  # default; overridden below
     local_features = []
     for start in range(0, Q, batch_size):
         end = min(start + batch_size, Q)
-        batch_patches = patches[start:end, :, :].unsqueeze(0)  # [1, B, 256, 3]
-        batch_feat = batch_patches.squeeze(0).cuda()  # [B, 256, 3]
-        batch_feat, _, _ = feature_extractor(batch_feat)
+        batch_patches = patches_256[start:end, :, :]
+        batch_feat, _, _ = feature_extractor(batch_patches)
         local_features.append(batch_feat)
 
     if local_features:
         local_features = torch.cat(local_features, 0)
     else:
-        local_features = torch.zeros(0, feat_dim, device=query_pts_t.device)
+        local_features = torch.zeros(0, 64, device=query_pts_t.device)
 
     return local_features
+
+
+# ---------------------------------------------------------------------------
+# Test-facing thin wrappers (plan 03-01 contract names)
+# ---------------------------------------------------------------------------
+
+def compute_lrf(ptnn_coords, ptnn_mask, ptnn_sqrt_dist, feature_radius):
+    """Computes only the LRF vectors (zp, xp, yp) from the nearest-dropped set.
+
+    Thin alias around ``_lrf_core`` that the test contract expects.
+    Used by ``test_lrf_parity`` (EXT-02).
+    """
+    return _lrf_core(ptnn_coords, ptnn_mask, ptnn_sqrt_dist, feature_radius)
+
+
+def subsample_seeded(patches, mask, seed, target_size=256):
+    """Seeded vectorised subsample matching the test contract.
+
+    Thin alias around ``subsample_256`` that the test contract expects.
+    Used by ``test_subsample_seeded`` (EXT-03).
+    """
+    return subsample_256(patches, seed)
+
+
+# Extract the LRF-only core so compute_lrf can call it without the full
+# rotation path needed for gpu_extract_features.
+def _lrf_core(ptnn_coords, ptnn_mask, ptnn_sqrt_dist, feature_radius):
+    """Core LRF computation — returns (zp, xp, yp) only.
+
+    Reproduces the CPU ``>10`` neighbor branch (data.py:43): when a query
+    has ≤ 10 real neighbours the LRF defaults to identity axes.
+    """
+    Q = ptnn_coords.shape[0]
+    device = ptnn_coords.device
+    n_ptnn = ptnn_mask.sum(dim=1).clamp(min=1)
+
+    # Default (identity) LRF for queries with ≤10 neighbours
+    zp0 = torch.tensor([0.0, 0.0, 1.0], device=device).expand(Q, 3)
+    xp0 = torch.tensor([1.0, 0.0, 0.0], device=device).expand(Q, 3)
+    yp0 = torch.tensor([0.0, 1.0, 0.0], device=device).expand(Q, 3)
+
+    has_neighbors = n_ptnn > 10
+    if not has_neighbors.any():
+        return zp0, xp0, yp0
+
+    # Only compute on queries with enough neighbours
+    q_keep = has_neighbors
+    idx_keep = q_keep.nonzero(as_tuple=True)[0]
+
+    sub_coords = ptnn_coords[idx_keep]
+    sub_mask = ptnn_mask[idx_keep]
+    sub_dist = ptnn_sqrt_dist[idx_keep]
+    sub_n = n_ptnn[idx_keep]
+
+    # eq.3 masked covariance
+    vect_diff = sub_coords * sub_mask[..., None]
+    cov = (torch.einsum('qni,qnj->qij', vect_diff, vect_diff)
+           / sub_n[..., None, None])
+    evals, evecs = torch.linalg.eigh(cov)
+    np_hat = evecs[:, :, 0]
+    flip = (torch.einsum('qi,qni->q', np_hat, -vect_diff)) > 0
+    sub_zp = torch.where(flip[:, None], np_hat, -np_hat)
+
+    # eq.5 in-plane axis xp
+    v_proj = vect_diff - (torch.einsum('qni,qj->qni', vect_diff, sub_zp)
+                          * sub_zp[:, None, :])
+    alpha = (feature_radius - sub_dist) ** 2
+    beta = (torch.einsum('qni,qi->qn', vect_diff, sub_zp)).square()
+    weighted = torch.einsum('qni,qn->qi', v_proj, alpha * beta)
+    w_norm = weighted.norm(dim=1)
+    safe_norm = torch.where(w_norm < _EPS, w_norm + _EPS, w_norm)
+    sub_xp = weighted / safe_norm[:, None]
+    sub_xp = sub_xp[:, :3]
+    sub_zp = sub_zp[:, :3]
+    sub_yp = torch.linalg.cross(sub_xp, sub_zp)
+
+    # Scatter back into Q-sized tensors
+    zp = zp0.clone()
+    xp = xp0.clone()
+    yp = yp0.clone()
+    zp[idx_keep] = sub_zp
+    xp[idx_keep] = sub_xp
+    yp[idx_keep] = sub_yp
+
+    return zp, xp, yp
