@@ -15,7 +15,7 @@ Decimal phases appear between their surrounding integers in numeric order.
 
 - [x] **Phase 1: Baseline, Parity & Profiling Harness** - Reproducible FP32 baseline + numerical-parity check + per-stage timing + profiling runbook; the regression gate for every later phase (completed 2026-06-11)
 - [ ] **Phase 2: Quick Wins / Ampere Utilization** - TF32/AMP precision setting, big descriptor batch + wired batch_size, DataLoader tuning, removed hot-loop empty_cache/gc, eig→eigh + torch.linalg.svd
-- [ ] **Phase 3: GPU-Native Patch Extraction** - GPU radius search, batched on-GPU eigh LRF, vectorized subsample, shared neighbor structure; the highest-impact refactor
+- [x] **Phase 3: GPU-Native Patch Extraction** - GPU radius search, batched on-GPU eigh LRF, vectorized subsample, shared neighbor structure; the highest-impact refactor (completed 2026-06-11)
 - [ ] **Phase 4: Batched Supervoxel Filtering** - GPU-resident correspondences, bucket+pad batching, batched Kabsch; collapses the per-supervoxel micro-launch loop
 - [ ] **Phase 5: Correspondence Search / GPU ANN** - On-device features + GPU ANN / tiled exact L2, removing the GPU→CPU feature dump
 - [ ] **Phase 6: I/O & Orchestration** - Eliminate redundant disk reads, pipeline tiles across CUDA streams, right-size tiles for 24 GB
@@ -98,7 +98,7 @@ Notes: Lowest-effort, lowest-risk tier (XS items) — done first. Re-profile aft
 
 **Wave 3** *(blocked on Wave 2)*
 
-- [ ] 03-04-PLAN.md — Seeded CPU-vs-GPU A/B parity gate + descriptor cos floor + speedup sign-off (EXT-05)
+- [x] 03-04-PLAN.md — Seeded CPU-vs-GPU A/B parity gate + descriptor cos floor + speedup sign-off (EXT-05)
 
 Notes: Highest-impact, largest refactor (L effort, medium parity risk). The neighbor-search library is chosen by a spike during planning, not pre-committed. Re-profile after this tier — the bottleneck is expected to move off the CPU; whatever surfaces next dictates the relative payoff of Phases 4-6.
 
@@ -178,7 +178,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7
 |-------|----------------|--------|-----------|
 | 1. Baseline, Parity & Profiling Harness | 3/3 | Complete    | 2026-06-11 |
 | 2. Quick Wins / Ampere Utilization | 0/TBD | Not started | - |
-| 3. GPU-Native Patch Extraction | 3/4 | In Progress|  |
+| 3. GPU-Native Patch Extraction | 4/4 | Complete   | 2026-06-11 |
 | 4. Batched Supervoxel Filtering | 0/TBD | Not started | - |
 | 5. Correspondence Search / GPU ANN | 0/TBD | Not started | - |
 | 6. I/O & Orchestration | 0/TBD | Not started | - |
