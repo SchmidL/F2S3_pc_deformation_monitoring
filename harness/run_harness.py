@@ -15,12 +15,14 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import torch
 
 from f2s3.core import F2S3RunSettings, feature_based_deformation_analysis
 
-# Intra-harness import — harness/ is its own directory, imported directly
+# Intra-harness imports — harness/ is its own directory, imported directly
 # when run_harness.py is invoked as a script.
+import parity
 import timing
 
 # ---------------------------------------------------------------------------
@@ -201,17 +203,297 @@ def _cmd_capture(args) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Subcommand stubs (fleshed out in Plans 02 / 03)
+# Subcommand: check (parity gate — HARN-02/05)
 # ---------------------------------------------------------------------------
 
 def _add_check_subparser(subparsers) -> None:
-    """Register the ``check`` subcommand (stub — Plan 02)."""
+    """Register the ``check`` subcommand (parity gate)."""
     parser_check = subparsers.add_parser(
         "check",
-        help="Run parity gate against baseline (Plan 02).",
+        help="Run parity gate against baseline (HARN-02/05).",
     )
-    parser_check.set_defaults(func=_cmd_stub("check", "Plan 02"))
+    parser_check.add_argument(
+        "--baseline",
+        type=Path,
+        required=True,
+        help="Path to the baseline run directory.",
+    )
+    parser_check.add_argument(
+        "--against",
+        type=Path,
+        default=None,
+        help="Path to an existing candidate run directory to compare.",
+    )
+    parser_check.add_argument(
+        "--warn",
+        type=float,
+        default=0.01,
+        help="WARN threshold in metres (default: 0.01 = 1 cm, D-04).",
+    )
+    parser_check.add_argument(
+        "--fail",
+        type=float,
+        default=0.05,
+        help="FAIL threshold in metres (default: 0.05 = 5 cm, D-04).",
+    )
+    parser_check.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Opt-in deterministic seed for numpy+torch RNGs (D-09, OFF by default).",
+    )
+    parser_check.set_defaults(func=_cmd_check)
 
+
+def _resolve_disp_files(run_dir: Path, label: str) -> list:
+    """Glob and validate displacement files for *run_dir*.
+
+    Args:
+        run_dir: Root directory of a pipeline run.
+        label: Human-readable label for error messages (e.g. ``"baseline"``).
+
+    Returns:
+        Sorted list of matching ``.txt`` paths.
+
+    Raises:
+        FileNotFoundError: No displacement files found.
+        RuntimeError: A matched file is empty.
+    """
+    pattern = str(run_dir / "output" / "results" / "displacement_magnitude_tile_*.txt")
+    matches = sorted(glob.glob(pattern))
+    if not matches:
+        raise FileNotFoundError(
+            f"No displacement files found in {label} — "
+            f"expected pattern: {pattern}. "
+            f"The pipeline may have silently failed (Pitfall 4)."
+        )
+    for path in matches:
+        if os.path.getsize(path) == 0:
+            raise RuntimeError(
+                f"Displacement file is empty in {label}: {path} "
+                f"(Pitfall 4 — pipeline produced no output)."
+            )
+    logging.info(f"{label}: {len(matches)} displacement file(s) found.")
+    return matches
+
+
+def _resolve_feat_files(run_dir: Path, label: str) -> list:
+    """Glob descriptor ``.npz`` files from the **features** subdirectory.
+
+    The descriptor ``.npz`` is written to ``<run_dir>/features/`` (NOT
+    ``output/results/``).  See ``core.py:367-375``.
+
+    Args:
+        run_dir: Root directory of a pipeline run.
+        label: Human-readable label for log messages.
+
+    Returns:
+        Sorted list of matching ``.npz`` paths (may be empty — Pitfall 3).
+    """
+    pattern = str(run_dir / "features" / "features_tile_*.npz")
+    matches = sorted(glob.glob(pattern))
+    if matches:
+        logging.info(f"{label}: {len(matches)} descriptor .npz file(s) found.")
+    else:
+        logging.warning(
+            f"{label}: no descriptor .npz files found at {pattern} — "
+            f"descriptors require --save_interim (Pitfall 3)."
+        )
+    return matches
+
+
+def _load_timings_json(run_dir: Path, label: str) -> Optional[dict]:
+    """Load ``timings.json`` from *run_dir* if it exists.
+
+    Returns:
+        The parsed dict, or ``None`` if the file is absent or unparseable.
+    """
+    path = run_dir / "timings.json"
+    if not path.is_file():
+        logging.info(f"{label}: no timings.json found — skipping timing delta.")
+        return None
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError) as exc:
+        logging.warning(f"{label}: failed to load {path}: {exc}")
+        return None
+
+
+def _print_check_report(
+    parity_result: dict,
+    verdict: str,
+    desc_diag: Optional[dict],
+    timing_delta: Optional[dict],
+    warn: float,
+    fail: float,
+) -> None:
+    """Print a structured parity-check report to stdout."""
+    lines = []
+    lines.append("=" * 60)
+    lines.append("  F2S3 Parity Check — Regression Gate (HARN-02/05)")
+    lines.append("=" * 60)
+    lines.append("")
+
+    # Headline
+    max_abs = parity_result.get("max_abs", float("nan"))
+    if np.isnan(max_abs):
+        lines.append(f"  max_abs (gate):  nan  ->  {verdict}")
+    else:
+        lines.append(
+            f"  max_abs (gate):  {max_abs:.6f} m  ->  {verdict}"
+        )
+    lines.append(f"  bands: WARN > {warn:.4f} m, FAIL > {fail:.4f} m")
+    lines.append("")
+
+    # Displacement diagnostics
+    lines.append("  --- Displacement Diagnostics (D-05) ---")
+    lines.append(f"  rms:              {parity_result.get('rms', 'nan')}")
+    lines.append(f"  p50:              {parity_result.get('p50', 'nan')}")
+    lines.append(f"  p95:              {parity_result.get('p95', 'nan')}")
+    lines.append(f"  p99:              {parity_result.get('p99', 'nan')}")
+    lines.append(f"  matched_fraction: {parity_result.get('matched_fraction', 'nan')}")
+    lines.append(
+        f"  n_baseline:       {parity_result.get('n_baseline', 'nan')}"
+    )
+    lines.append(
+        f"  n_candidate:      {parity_result.get('n_candidate', 'nan')}"
+    )
+    lines.append("")
+
+    # Descriptor diagnostic
+    lines.append("  --- Descriptor Drift (D-06, diagnostic only) ---")
+    if desc_diag is not None:
+        lines.append(f"  cos_mean:  {desc_diag.get('cos_mean', 'nan'):.6f}")
+        lines.append(f"  cos_min:   {desc_diag.get('cos_min', 'nan'):.6f}")
+        lines.append(f"  l2_mean:   {desc_diag.get('l2_mean', 'nan'):.6f}")
+        lines.append(f"  l2_max:    {desc_diag.get('l2_max', 'nan'):.6f}")
+    else:
+        lines.append("  (skipped — no descriptor .npz files found)")
+    lines.append("")
+
+    # Timing deltas
+    lines.append("  --- Timing Delta vs Baseline (HARN-03) ---")
+    if timing_delta is not None:
+        for stage, delta_s in timing_delta.items():
+            if delta_s is not None:
+                sign = "+" if delta_s >= 0 else ""
+                lines.append(f"  {stage:18s}: {sign}{delta_s:+.2f} s")
+            else:
+                lines.append(f"  {stage:18s}: (not available)")
+    else:
+        lines.append("  (skipped — no timings.json found)")
+    lines.append("")
+
+    # Units note (A1)
+    lines.append("  Note: bands assume coordinates are in metres (A1).")
+    lines.append(f"  If units differ, adjust --warn / --fail accordingly.")
+    lines.append("=" * 60)
+
+    print("\n".join(lines))
+
+
+def _cmd_check(args) -> None:
+    """Execute the check subcommand — the regression gate.
+
+    Exit-code contract (HARN-05):
+    - PASS / WARN → exit 0
+    - FAIL       → exit non-zero (``sys.exit(1)``)
+    """
+    baseline_dir: Path = args.baseline
+    against_dir: Optional[Path] = args.against
+    warn: float = args.warn
+    fail: float = args.fail
+    seed: Optional[int] = args.seed
+
+    # Validate paths (Security V5 / T-02-01)
+    if not baseline_dir.is_dir():
+        raise FileNotFoundError(
+            f"Baseline directory not found: {baseline_dir.resolve()}"
+        )
+    if against_dir is None:
+        raise ValueError(
+            "--against is required (specify a candidate run directory to compare)."
+        )
+    if not against_dir.is_dir():
+        raise FileNotFoundError(
+            f"Candidate directory not found: {against_dir.resolve()}"
+        )
+
+    logging.info(f"check: baseline = {baseline_dir.resolve()}")
+    logging.info(f"check: against  = {against_dir.resolve()}")
+    logging.info(f"check: WARN > {warn:.4f} m, FAIL > {fail:.4f} m")
+    if seed is not None:
+        logging.info(f"check: seed = {seed}")
+
+    # Resolve displacement files (Pitfall 4 guard)
+    base_disp_files = _resolve_disp_files(baseline_dir, "baseline")
+    cand_disp_files = _resolve_disp_files(against_dir, "candidate")
+
+    # Compare the first (and for _small, only) tile
+    base_disp = Path(base_disp_files[0])
+    cand_disp = Path(cand_disp_files[0])
+    logging.info(f"  baseline disp: {base_disp}")
+    logging.info(f"  candidate disp: {cand_disp}")
+
+    # --- Apply parity gate (D-03, D-05) ---
+    r = parity.displacement_parity(base_disp, cand_disp)
+    max_abs = r["max_abs"]
+
+    # Determine verdict from band contract (D-04)
+    if np.isnan(max_abs):
+        verdict = "FAIL"
+    elif max_abs <= warn:
+        verdict = "PASS"
+    elif max_abs <= fail:
+        verdict = "WARN"
+    else:
+        verdict = "FAIL"
+
+    # --- Descriptor diagnostic (D-06, diagnostic only) ---
+    base_feat_files = _resolve_feat_files(baseline_dir, "baseline")
+    cand_feat_files = _resolve_feat_files(against_dir, "candidate")
+    desc_diag = None
+    if base_feat_files and cand_feat_files:
+        desc_diag = parity.descriptor_drift(
+            Path(base_feat_files[0]), Path(cand_feat_files[0])
+        )
+
+    # --- Timing deltas ---
+    base_timing = _load_timings_json(baseline_dir, "baseline")
+    cand_timing = _load_timings_json(against_dir, "candidate")
+    timing_delta = None
+    if base_timing is not None and cand_timing is not None:
+        timing_delta = {}
+        for stage in ["features", "supervoxels", "correspondences", "filtering"]:
+            bt = base_timing.get(stage)
+            ct = cand_timing.get(stage)
+            timing_delta[stage] = (ct - bt) if (bt is not None and ct is not None) else None
+
+    # --- Print structured report ---
+    _print_check_report(r, verdict, desc_diag, timing_delta, warn, fail)
+
+    # --- Exit-code contract (HARN-05) ---
+    if verdict == "FAIL":
+        logging.error(f"check: FAIL — max_abs={max_abs} > fail={fail}")
+        sys.exit(1)
+
+    if verdict == "WARN":
+        logging.warning(
+            f"check: WARN — max_abs={max_abs:.6f} in ({warn}, {fail}] — "
+            f"surface drift without auto-blocking (D-04)."
+        )
+    else:
+        logging.info(f"check: PASS — max_abs={max_abs:.6f} <= warn={warn}")
+
+    # PASS and WARN exit 0 (implicit)
+    return 0
+
+
+
+# ---------------------------------------------------------------------------
+# Subcommand stubs (fleshed out in Plan 03)
+# ---------------------------------------------------------------------------
 
 def _add_profile_subparser(subparsers) -> None:
     """Register the ``profile`` subcommand (stub — Plan 03)."""
