@@ -86,7 +86,7 @@ Notes: Lowest-effort, lowest-risk tier (XS items) — done first. Re-profile aft
 
 **Wave 0** *(test scaffolding + settings contract + gate decision)*
 
-- [ ] 03-01-PLAN.md — RED parity-test scaffold + extraction_backend/extraction_seed settings + EXT-05 gate-metric decision (EXT-01..EXT-05)
+- [x] 03-01-PLAN.md — RED parity-test scaffold + extraction_backend/extraction_seed settings + EXT-05 gate-metric decision (EXT-01..EXT-05)
 
 **Wave 1** *(blocked on Wave 0)*
 
@@ -178,7 +178,7 @@ Phases execute in numeric order: 1 → 2 → 3 → 4 → 5 → 6 → 7
 |-------|----------------|--------|-----------|
 | 1. Baseline, Parity & Profiling Harness | 3/3 | Complete    | 2026-06-11 |
 | 2. Quick Wins / Ampere Utilization | 0/TBD | Not started | - |
-| 3. GPU-Native Patch Extraction | 0/4 | Planned     | - |
+| 3. GPU-Native Patch Extraction | 1/4 | In Progress|  |
 | 4. Batched Supervoxel Filtering | 0/TBD | Not started | - |
 | 5. Correspondence Search / GPU ANN | 0/TBD | Not started | - |
 | 6. I/O & Orchestration | 0/TBD | Not started | - |

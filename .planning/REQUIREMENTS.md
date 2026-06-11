@@ -27,11 +27,11 @@ Requirements for this milestone. Source: `_input/F2S3_performance_optimization.m
 
 ### GPU-Native Patch Extraction (§2 — L effort, highest impact)
 
-- [ ] **EXT-01**: Per-point radius/neighbor search runs on the GPU (library selected by spike: FRNN / torch_cluster / PyTorch3D / Open3D-tensor), replacing the Open3D per-point CPU KD-tree
-- [ ] **EXT-02**: The LRF eigendecomposition is batched on-GPU via `torch.linalg.eigh` over stacked 3×3 covariances, with the LRF math vectorized
-- [ ] **EXT-03**: The 256-point subsample is vectorized (no per-point `np.random.choice`) with an option for deterministic seeding for the harness
-- [ ] **EXT-04**: The neighbor structure is computed once per cloud and reused across resolution estimate, descriptor LRF, and supervoxels where radii align
-- [ ] **EXT-05**: GPU-native extraction reproduces baseline descriptors within parity tolerance (HARN-02)
+- [x] **EXT-01**: Per-point radius/neighbor search runs on the GPU (library selected by spike: FRNN / torch_cluster / PyTorch3D / Open3D-tensor), replacing the Open3D per-point CPU KD-tree
+- [x] **EXT-02**: The LRF eigendecomposition is batched on-GPU via `torch.linalg.eigh` over stacked 3×3 covariances, with the LRF math vectorized
+- [x] **EXT-03**: The 256-point subsample is vectorized (no per-point `np.random.choice`) with an option for deterministic seeding for the harness
+- [x] **EXT-04**: The neighbor structure is computed once per cloud and reused across resolution estimate, descriptor LRF, and supervoxels where radii align
+- [x] **EXT-05**: GPU-native extraction reproduces baseline descriptors within parity tolerance (HARN-02)
 
 ### Batched Supervoxel Filtering (§3 — M effort, high impact)
 
