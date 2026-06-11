@@ -23,6 +23,7 @@ from f2s3.core import F2S3RunSettings, feature_based_deformation_analysis
 # Intra-harness imports — harness/ is its own directory, imported directly
 # when run_harness.py is invoked as a script.
 import parity
+import profile_wrapper
 import timing
 
 # ---------------------------------------------------------------------------
@@ -492,27 +493,85 @@ def _cmd_check(args) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Subcommand stubs (fleshed out in Plan 03)
+# Subcommand: profile (HARN-04 profiling runbook dispatch)
 # ---------------------------------------------------------------------------
 
 def _add_profile_subparser(subparsers) -> None:
-    """Register the ``profile`` subcommand (stub — Plan 03)."""
+    """Register the ``profile`` subcommand (torch.profiler wrapper)."""
     parser_profile = subparsers.add_parser(
         "profile",
-        help="Profiling runbook dispatch (Plan 03).",
+        help="Run the _small pair under torch.profiler and print a CPU+CUDA "
+        "attribution table (HARN-04).",
     )
-    parser_profile.set_defaults(func=_cmd_stub("profile", "Plan 03"))
+    parser_profile.add_argument(
+        "--out",
+        type=Path,
+        default=Path("profile_out"),
+        help="Output directory for the profiled pipeline artifacts "
+        "(default: profile_out/).",
+    )
+    parser_profile.add_argument(
+        "--seed",
+        type=int,
+        default=None,
+        help="Opt-in deterministic seed for reproducibility (D-09).",
+    )
+    parser_profile.add_argument(
+        "--row-limit",
+        type=int,
+        default=20,
+        help="Maximum rows in the printed profiler table (default: 20).",
+    )
+    parser_profile.set_defaults(func=_cmd_profile)
 
 
-def _cmd_stub(name: str, planned_in: str):
-    """Return a stub handler that informs the user the subcommand is pending."""
+def _cmd_profile(args) -> None:
+    """Execute the profile subcommand — runs the pipeline under torch.profiler.
 
-    def _stub(args) -> None:
-        logging.warning(
-            f"'{name}' subcommand is not yet implemented — planned in {planned_in}."
-        )
+    Wraps the full pipeline invocation on the ``_small`` pair in a
+    ``torch.profiler.profile`` context so the printed ``key_averages``
+    table attributes time across CPU ops, CUDA kernels, and host↔device
+    transfers.  This satisfies HARN-04's "non-empty attribution table"
+    requirement.
 
-    return _stub
+    High CPU self-time + low CUDA time on the feature-extraction stage
+    confirms the CPU-bound extraction thesis (§2 of the source plan);
+    the interpretation rule is documented in ``PROFILING_RUNBOOK.md``.
+    """
+    out_dir: Path = args.out
+    seed: int = args.seed
+    row_limit: int = args.row_limit
+
+    logging.info(f"Profile: pipeline -> {out_dir.resolve()}")
+    logging.info(f"  source: {SMALL_S}")
+    logging.info(f"  target: {SMALL_T}")
+    if seed is not None:
+        logging.info(f"  seed:   {seed}")
+
+    # Run the full pipeline under torch.profiler so every PyTorch op —
+    # including the two heaviest stages (compute_local_features and
+    # filter_correspondences) — is captured with CPU + CUDA attribution.
+    profile_wrapper.profile_pipeline(
+        run_fn=lambda: run_pipeline(
+            results_dir=out_dir,
+            source=SMALL_S,
+            target=SMALL_T,
+            save_interim=False,  # skip .npz to keep the profile lean
+            verbose=True,        # per-stage timing logs
+            seed=seed,
+        ),
+        row_limit=row_limit,
+    )
+
+    _record_env_json(out_dir)
+    _assert_displacement_artifact_exists(out_dir)
+
+    logging.info(f"Profile completed — artifacts in {out_dir.resolve()}")
+    logging.info(
+        "Interpretation: high CPU self-time + low CUDA time on "
+        "feature-extraction confirms CPU-bound extraction.  "
+        "See PROFILING_RUNBOOK.md for the full attribution guide."
+    )
 
 
 # ---------------------------------------------------------------------------
