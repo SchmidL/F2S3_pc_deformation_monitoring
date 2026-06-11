@@ -33,6 +33,14 @@ def main():
     parser.add_argument('--neighborhood_radius', type=float, default=argparse.SUPPRESS,
         help='Neighborhood radius for local feature extraction. Overrides the default '
              'sqrt(3) * 10 * median_resolution (auto-derived if 0)')
+    parser.add_argument('--extraction_backend', type=str, default=argparse.SUPPRESS,
+        help='Extraction backend for local feature patch construction: "gpu" (default) '
+             'or "cpu" (the original DataLoader/CPU-extract path). '
+             'The gpu backend constructs patches on-device and does NOT use the '
+             'DataLoader workers; --Q W-02/--Q W-03 knobs apply only to the cpu backend.')
+    parser.add_argument('--extraction_seed', type=int, default=argparse.SUPPRESS,
+        help='Seed for the GPU subsample (default 41). Deterministic by default. '
+             'Set to a non-negative integer.')
     parser.add_argument(
         '--save_interim', action='store_true',
         help='Save interim results such as pointwise feature desriptors and supervoxels.')

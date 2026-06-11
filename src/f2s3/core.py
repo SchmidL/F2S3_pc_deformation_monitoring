@@ -113,12 +113,14 @@ class F2S3RunSettings:
     start_from_tiled_data: bool = False
     tiled_data: Optional[Path] = None
     max_points_per_tile: int = 1000000
-    batch_size: int = 10000
+    batch_size: int = 1000
     voxel_grid_size: float = 0.0
     max_disp_magnitude: float = 0.0
     neighborhood_radius: float = 0.0
     save_interim: bool = False
     verbose: bool = False
+    extraction_backend: str = "gpu"
+    extraction_seed: int = 41
     filter_median_magnitude: bool = False
     refine_results: bool = False
     fill_gaps_c2c: bool = False
@@ -164,7 +166,16 @@ class F2S3RunSettings:
             raise ValueError("Maximum displacement magnitude can't be negative!")
         if self.neighborhood_radius < 0.0:
             raise ValueError("Neighborhood radius can't be negative!")
-
+        if self.extraction_backend not in {"cpu", "gpu"}:
+            raise ValueError(
+                f"extraction_backend must be 'cpu' or 'gpu', "
+                f"got {self.extraction_backend!r}"
+            )
+        if self.extraction_seed < 0:
+            raise ValueError(
+                f"extraction_seed must be a non-negative integer, "
+                f"got {self.extraction_seed}"
+            )
 
         # Prepare the logger
         logger = logging.getLogger()
@@ -224,6 +235,8 @@ class PointCloudTile:
         self.feature_extractor = feature_extractor
         self.filtering_network = filtering_network
 
+        self.extraction_backend = args.extraction_backend
+        self.extraction_seed = args.extraction_seed
         self.refine_results = args.refine_results
         self.max_disp_magnitude = args.max_disp_magnitude
         self.filter_median_magnitude = args.filter_median_magnitude
