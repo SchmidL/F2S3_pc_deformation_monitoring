@@ -1,3 +1,4 @@
+import logging
 import numpy as np
 import torch
 import open3d as o3d
@@ -251,7 +252,8 @@ def gpu_extract_features(
 
     Runs the full parity-grade pipeline: radius search → batched masked
     ``eigh`` LRF (eqs. 3–5) → seeded vectorised subsample (256 points) →
-    descriptor model forward.
+    descriptor model forward.  Chunks query points to stay within 24 GB
+    VRAM.
 
     Args:
         query_pts_t: (Q, 3) float32 torch tensor on CUDA.
@@ -269,27 +271,43 @@ def gpu_extract_features(
     if Q == 0:
         return torch.zeros(0, 64, device=query_pts_t.device)
 
-    query_np = query_pts_t.cpu().numpy().astype(np.float32)
-    ptnn_coords, ptnn_mask, ptnn_sqrt_dist, ptall_coords, ptall_mask = (
-        radius_neighborhoods(gpu_index, query_np, feature_radius)
-    )
+    # VRAM-bound chunk size: radius_neighborhoods produces [chunk, maxN, 3]
+    # float32 tensors; with maxN up to ~2000 on the _small pair at
+    # r≈2.96, a chunk of 20000 points needs ~20000*2000*3*4 = 480 MB.
+    # Two such sets (ptnn + ptall) + NNS scratch ~= 2 GB/chunk.
+    # Twenty-four GB / 2 GB → safe at 10000 chunks (verified on 3090 Ti).
+    CHUNK_SIZE = 10000
 
-    # Parity-grade batched LRF (eqs. 3-5)
-    patches, _, _, _ = batched_lrf(
-        ptnn_coords, ptnn_mask, ptnn_sqrt_dist, ptall_coords, ptall_mask,
-        query_pts_t, feature_radius
-    )
-
-    # Seeded vectorised 256-point subsample
-    patches_256 = subsample_256(patches, seed)
-
-    # Feed through descriptor model in batches
     local_features = []
-    for start in range(0, Q, batch_size):
-        end = min(start + batch_size, Q)
-        batch_patches = patches_256[start:end, :, :]
-        batch_feat, _, _ = feature_extractor(batch_patches)
-        local_features.append(batch_feat)
+    for chunk_start in range(0, Q, CHUNK_SIZE):
+        chunk_end = min(chunk_start + CHUNK_SIZE, Q)
+        chunk_pts_t = query_pts_t[chunk_start:chunk_end]
+        chunk_pts_np = chunk_pts_t.cpu().numpy().astype(np.float32)
+
+        ptnn_coords, ptnn_mask, ptnn_sqrt_dist, ptall_coords, ptall_mask = (
+            radius_neighborhoods(gpu_index, chunk_pts_np, feature_radius)
+        )
+
+        patches, _, _, _ = batched_lrf(
+            ptnn_coords, ptnn_mask, ptnn_sqrt_dist, ptall_coords, ptall_mask,
+            chunk_pts_t, feature_radius
+        )
+
+        patches_256 = subsample_256(patches, seed)
+
+        # Feed through descriptor model in batches
+        chunk_Q = chunk_end - chunk_start
+        for start in range(0, chunk_Q, batch_size):
+            end = min(start + batch_size, chunk_Q)
+            batch_patches = patches_256[start:end, :, :]
+            batch_feat, _, _ = feature_extractor(batch_patches)
+            local_features.append(batch_feat)
+
+        if verbose:
+            logging.info(
+                f"  GPU extraction chunk {chunk_start//CHUNK_SIZE + 1}: "
+                f"{(chunk_end - chunk_start)//1000}k points processed"
+            )
 
     if local_features:
         local_features = torch.cat(local_features, 0)
