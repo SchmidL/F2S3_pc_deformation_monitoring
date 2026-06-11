@@ -19,6 +19,10 @@ import torch
 
 from f2s3.core import F2S3RunSettings, feature_based_deformation_analysis
 
+# Intra-harness import — harness/ is its own directory, imported directly
+# when run_harness.py is invoked as a script.
+import timing
+
 # ---------------------------------------------------------------------------
 # Fixed reference pair (D-01, D-02 — small-only gate)
 # ---------------------------------------------------------------------------
@@ -37,6 +41,7 @@ def run_pipeline(
     save_interim: bool = True,
     verbose: bool = True,
     seed: Optional[int] = None,
+    log_lines: Optional[list] = None,
 ) -> None:
     """Run the real F2S3 pipeline in-process on a single tile-pair.
 
@@ -53,6 +58,11 @@ def run_pipeline(
         verbose: Enable per-stage timing log lines consumed by HARN-03.
         seed: If not ``None``, seed numpy + torch RNGs before the run
             (D-09 opt-in determinism, OFF by default).
+        log_lines: If provided, a list that will be populated with
+            formatted log records from the pipeline run (for HARN-03
+            timing harvest).  The capture handler is installed *after*
+            ``F2S3RunSettings`` configures logging so it survives
+            ``coloredlogs.install()``.
     """
     if seed is not None:
         import numpy as np
@@ -70,8 +80,20 @@ def run_pipeline(
         verbose=verbose,
     )
 
-    with torch.no_grad():
-        feature_based_deformation_analysis(settings)
+    # Install log-capture handler AFTER coloredlogs.install() so it
+    # survives the handler reset in F2S3RunSettings.__post_init__.
+    capture_handler = None
+    if log_lines is not None:
+        capture_handler = timing._CaptureHandler(log_lines)
+        capture_handler.setLevel(logging.INFO)
+        logging.getLogger().addHandler(capture_handler)
+
+    try:
+        with torch.no_grad():
+            feature_based_deformation_analysis(settings)
+    finally:
+        if capture_handler is not None:
+            logging.getLogger().removeHandler(capture_handler)
 
 
 def _record_env_json(out_dir: Path) -> None:
@@ -155,6 +177,9 @@ def _cmd_capture(args) -> None:
     if seed is not None:
         logging.info(f"  seed:   {seed}")
 
+    # Capture per-stage --verbose log lines for HARN-03 timing harvest.
+    log_lines: list = []
+
     run_pipeline(
         results_dir=out_dir,
         source=SMALL_S,
@@ -162,10 +187,15 @@ def _cmd_capture(args) -> None:
         save_interim=True,   # required for descriptor .npz (Pitfall 3)
         verbose=True,        # required for per-stage timing logs (HARN-03)
         seed=seed,
+        log_lines=log_lines,
     )
 
     _record_env_json(out_dir)
     _assert_displacement_artifact_exists(out_dir)
+
+    # Harvest stage timings and persist as a JSON sidecar (HARN-03).
+    stage_timings = timing.parse_stage_timings(log_lines)
+    timing.write_timings(stage_timings, out_dir)
 
     logging.info(f"Baseline captured successfully in {out_dir.resolve()}")
 
