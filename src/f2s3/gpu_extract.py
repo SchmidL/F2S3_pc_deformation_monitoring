@@ -103,9 +103,16 @@ def radius_neighborhoods(gpu_index, query_positions, feature_radius):
         nns.fixed_radius_index(feature_radius)
         gpu_index._radius_index_built = True
     dev = o3c.Device("CUDA:0")
-    q = o3c.Tensor(
-        query_positions.astype(np.float32).copy(), dtype=o3c.float32, device=dev
-    )
+    if isinstance(query_positions, torch.Tensor):
+        q = o3c.Tensor.from_dlpack(
+            torch.utils.dlpack.to_dlpack(
+                query_positions.contiguous().to(torch.float32)
+            )
+        )
+    else:
+        q = o3c.Tensor(
+            query_positions.astype(np.float32).copy(), dtype=o3c.float32, device=dev
+        )
 
     idx, dist, splits = nns.fixed_radius_search(q, feature_radius)
 
@@ -127,7 +134,7 @@ def radius_neighborhoods(gpu_index, query_positions, feature_radius):
             start_ofs = t_splits[:-1]
         else:
             c = (counts - 1).clamp(min=0)
-            start_ofs = t_splits[:-1] + 1  # skip the nearest/self point
+            start_ofs = t_splits[:-1] + 1
 
         max_nn = int(c.max())
         if max_nn == 0:
@@ -140,23 +147,29 @@ def radius_neighborhoods(gpu_index, query_positions, feature_radius):
         if not torch.any(c > 0):
             return coords, mask, sqrt_dist
 
-        # Build flat source and destination indices for a single scatter
-        # For each query q, neighbours at CSR[s[q] .. s[q]+n[q]-1] → row q, cols 0..n[q]-1
+        # Fully vectorized scatter — no Python loops.
+        # For each non-empty query q with n neighbours at CSR offset s,
+        # place neighbours at padded row q, columns 0..n-1.
         nz_mask = c > 0
         nz_c = c[nz_mask]
-        nz_start = start_ofs[nz_mask]  # flat CSR start per non-empty query
+        nz_start = start_ofs[nz_mask]
         nz_q = torch.arange(Q, device=c.device)[nz_mask]
 
         total = int(nz_c.sum().item())
-        # Broadcast each query row to the number of neighbours it has
+
+        # Query index per flat neighbour
         q_rep = torch.repeat_interleave(nz_q, nz_c)
-        # Column offset: 0, 1, 2, ..., n-1 for each query, concatenated
-        col_rep = torch.cat([torch.arange(n.item(), device=c.device) for n in nz_c])
-        # Source flat CSR index: s[q] + 0, s[q] + 1, ..., s[q] + n-1
-        src_rep = torch.cat([
-            torch.arange(s.item(), s.item() + n.item(), device=c.device)
-            for s, n in zip(nz_start, nz_c)
-        ])
+
+        # Column offset: 0,1,2,...,n-1 per query (fully vectorized via exclusive-prefix)
+        per_q = torch.zeros(Q, dtype=torch.long, device=c.device)
+        per_q[nz_q] = nz_c
+        ex_prefix = per_q.cumsum(dim=0) - per_q
+        col_rep = torch.arange(total, device=c.device) - ex_prefix[q_rep]
+
+        # Source flat CSR index per neighbour
+        src_start = torch.zeros(Q, dtype=torch.long, device=c.device)
+        src_start[nz_q] = nz_start
+        src_rep = src_start[q_rep] + col_rep
 
         coords[q_rep, col_rep] = overlap[t_idx[src_rep]] - q_t[q_rep]
         sqrt_dist[q_rep, col_rep] = t_dist[src_rep].sqrt()
@@ -290,10 +303,9 @@ def gpu_extract_features(
     for chunk_start in range(0, Q, CHUNK_SIZE):
         chunk_end = min(chunk_start + CHUNK_SIZE, Q)
         chunk_pts_t = query_pts_t[chunk_start:chunk_end]
-        chunk_pts_np = chunk_pts_t.cpu().numpy().astype(np.float32)
 
         ptnn_coords, ptnn_mask, ptnn_sqrt_dist, ptall_coords, ptall_mask = (
-            radius_neighborhoods(gpu_index, chunk_pts_np, feature_radius)
+            radius_neighborhoods(gpu_index, chunk_pts_t, feature_radius)
         )
 
         patches, _, _, _ = batched_lrf(
