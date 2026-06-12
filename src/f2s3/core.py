@@ -332,9 +332,13 @@ class PointCloudTile:
             neighborhood_radius = _radius_from_resolution(self.median_resolution)
 
         if self.verbose:
+            # extraction_backend (cpu/gpu) only applies to the DIP descriptor; GeDi
+            # builds its own patches, so only echo the backend for DIP.
+            backend_info = (f", backend: {self.extraction_backend}"
+                            if self.descriptor.name == "dip" else "")
             logging.info(
                 f"Starting the computation of local feature descriptors. "
-                f"Backend: {self.extraction_backend}. "
+                f"Descriptor: {self.descriptor.name}{backend_info}. "
                 f"Neighborhood radius: {neighborhood_radius:.3f}")
 
         start_time = time.time()

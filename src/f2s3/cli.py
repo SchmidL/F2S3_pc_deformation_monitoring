@@ -46,8 +46,11 @@ def main():
              'The gedi backend requires the pointnet2_ops and torchgeometry packages and '
              'ignores --extraction_backend (GeDi builds its own patches internally).')
     parser.add_argument('--gedi_r_lrf', type=float, default=argparse.SUPPRESS,
-        help='LRF / neighbourhood radius for the GeDi descriptor. If 0 (default), the '
-             'pipeline neighborhood_radius is used. Only applies to --descriptor gedi.')
+        help='LRF / patch radius for the GeDi descriptor. If 0 (default), the pipeline '
+             'neighborhood_radius is used. Only applies to --descriptor gedi. GeDi samples '
+             '4000 points per patch; if your cloud is sparse relative to this radius the '
+             'patches get heavily up-sampled (replicated), which weakens the descriptors. '
+             'If GeDi matches look weak, increase this so each patch holds more real points.')
     parser.add_argument(
         '--save_interim', action='store_true',
         help='Save interim results such as pointwise feature desriptors and supervoxels.')

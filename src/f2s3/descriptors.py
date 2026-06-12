@@ -18,6 +18,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from scipy.spatial import cKDTree
 from tqdm import tqdm
 
 from .descriptor_model import PointNetFeature
@@ -32,6 +33,7 @@ class DipDescriptor:
     ``compute_local_features`` so behaviour (and DIP parity) is preserved.
     """
 
+    name = "dip"
     dim = 64
 
     def __init__(self, model, extraction_backend, batch_size, extraction_seed, verbose):
@@ -73,15 +75,85 @@ class DipDescriptor:
             self.extraction_seed, verbose=self.verbose)
 
 
+def _gedi_compute_gpu(gedi, query_pts, search_pts):
+    """GPU-vectorised replacement for ``GeDi.compute``.
+
+    Upstream ``GeDi.compute`` builds each patch in a per-point Python loop and runs
+    the LRF SVD on CPU — together ~60% of runtime, with the GPU idle. This keeps the
+    exact GeDi network + LRF math but:
+
+    - builds all patches in a batch with one vectorised gather on the GPU, and
+    - runs the LRF on the GPU (``gedi.lrf.device`` is set to ``cuda`` by the caller).
+
+    Sampling draws ``samples_per_patch_lrf`` neighbours uniformly **with replacement**
+    from each query's in-radius set. Upstream draws without replacement when a patch
+    has enough points and otherwise pads with random replicas; in the F2S3 regime
+    patches hold far fewer points than ``samples_per_patch_lrf`` (heavy replication
+    either way), so the two are statistically equivalent. GeDi is not parity-gated,
+    so this RNG/device change is acceptable.
+
+    Args:
+        gedi: a vendored ``GeDi`` instance (network + LRF already on CUDA).
+        query_pts: (N, 3) float32 numpy array of descriptor centres.
+        search_pts: (M, 3) float32 numpy array of the cloud to search.
+
+    Returns:
+        (N, gedi.dim) numpy array of unit-normalised descriptors.
+    """
+    device = "cuda"
+    spb = gedi.samples_per_batch
+    sppl = gedi.samples_per_patch_lrf
+    N = query_pts.shape[0]
+
+    pcd_t = torch.from_numpy(search_pts).float().to(device)          # [M, 3]
+    pts_t = torch.from_numpy(query_pts).float()
+
+    tree = cKDTree(search_pts)
+    neigh = tree.query_ball_point(query_pts, r=gedi.r_lrf, workers=-1)
+
+    desc = np.empty((N, gedi.dim))
+    for b in range(int(np.ceil(N / spb))):
+        i0 = b * spb
+        i1 = min((b + 1) * spb, N)
+        batch = neigh[i0:i1]
+
+        cnt = np.fromiter((len(n) for n in batch), dtype=np.int64, count=i1 - i0)
+        cnt = np.clip(cnt, 1, None)
+        max_n = int(cnt.max())
+
+        # Pad each query's neighbour-index list into a dense [b, max_n] matrix.
+        pad = np.zeros((i1 - i0, max_n), dtype=np.int64)
+        for k, n in enumerate(batch):
+            if len(n):
+                pad[k, :len(n)] = n
+        pad_t = torch.from_numpy(pad).to(device)                     # [b, max_n]
+        cnt_t = torch.from_numpy(cnt).to(device)                     # [b]
+
+        # Uniform-with-replacement sample positions in [0, cnt) per query.
+        samp = (torch.rand(i1 - i0, sppl, device=device) * cnt_t[:, None]).long()
+        gidx = torch.gather(pad_t, 1, samp)                          # [b, sppl] global idx
+        patch_pts = pcd_t[gidx]                                      # [b, sppl, 3]
+        x = patch_pts.transpose(1, 2).contiguous()                  # [b, 3, sppl]
+
+        patch = gedi.lrf(pts_t[i0:i1].to(device), x)                # GPU LRF -> [b, 3, out]
+        with torch.no_grad():
+            f = gedi.gedi_net(patch)
+        desc[i0:i1] = f.cpu().numpy()[:i1 - i0]
+
+    return desc
+
+
 class GediDescriptor:
     """GeDi local descriptor (vendored, 32-d).
 
-    The GeDi network owns its own neighbour search + LRF + PointNet++ sampling via
-    ``GeDi.compute(pts, pcd)``. ``r_lrf`` defaults to the per-tile
-    ``neighborhood_radius`` (the same scale DIP searches over) unless a fixed value
-    is supplied via ``--gedi_r_lrf``. The loaded network is reused across tiles; only
-    ``r_lrf`` is updated per call.
+    The GeDi network owns its own neighbour search + LRF + PointNet++ sampling.
+    ``r_lrf`` defaults to the per-tile ``neighborhood_radius`` (the same scale DIP
+    searches over) unless a fixed value is supplied via ``--gedi_r_lrf``. The loaded
+    network is reused across tiles; only ``r_lrf`` is updated per call. Extraction uses
+    the GPU-vectorised :func:`_gedi_compute_gpu` path.
     """
+
+    name = "gedi"
 
     def __init__(self, checkpoint_path, fixed_r_lrf=0.0, samples_per_batch=500,
                  samples_per_patch_lrf=4000, samples_per_patch_out=512, dim=32,
@@ -102,15 +174,17 @@ class GediDescriptor:
             'fchkpt_gedi_net': str(checkpoint_path),
         }
         self.gedi = GeDi(config)
+        # Run the LRF SVD on the GPU (see _gedi_compute_gpu).
+        self.gedi.lrf.device = "cuda"
 
     def extract_features(self, query_pcd, search_pcd, neighborhood_radius):
         r_lrf = self.fixed_r_lrf if self.fixed_r_lrf > 0.0 else neighborhood_radius
         self.gedi.r_lrf = r_lrf
         self.gedi.lrf.r_lrf = r_lrf
 
-        pts = torch.from_numpy(np.asarray(query_pcd.points)).float()
-        pcd = torch.from_numpy(np.asarray(search_pcd.points)).float()
-        desc = self.gedi.compute(pts=pts, pcd=pcd)  # np [N, dim]
+        query_pts = np.asarray(query_pcd.points).astype(np.float32)
+        search_pts = np.asarray(search_pcd.points).astype(np.float32)
+        desc = _gedi_compute_gpu(self.gedi, query_pts, search_pts)  # np [N, dim]
         return torch.from_numpy(desc).float()
 
 
