@@ -18,7 +18,6 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from scipy.spatial import cKDTree
 from tqdm import tqdm
 
 from .descriptor_model import PointNetFeature
@@ -76,21 +75,20 @@ class DipDescriptor:
 
 
 def _gedi_compute_gpu(gedi, query_pts, search_pts):
-    """GPU-vectorised replacement for ``GeDi.compute``.
+    """GPU replacement for ``GeDi.compute`` using F2S3's GPU radius search.
 
-    Upstream ``GeDi.compute`` builds each patch in a per-point Python loop and runs
-    the LRF SVD on CPU — together ~60% of runtime, with the GPU idle. This keeps the
-    exact GeDi network + LRF math but:
+    Upstream ``GeDi.compute`` runs a CPU ``cKDTree`` search plus a per-point Python
+    gather loop and a CPU LRF SVD — together the bulk of runtime, with the GPU idle.
+    This keeps the exact GeDi network + LRF math but builds neighbourhoods with
+    F2S3's GPU fixed-radius search (``gpu_extract.radius_neighborhoods``) and runs
+    everything (patch sampling, LRF, network) on the GPU, chunked to bound VRAM.
 
-    - builds all patches in a batch with one vectorised gather on the GPU, and
-    - runs the LRF on the GPU (``gedi.lrf.device`` is set to ``cuda`` by the caller).
-
-    Sampling draws ``samples_per_patch_lrf`` neighbours uniformly **with replacement**
-    from each query's in-radius set. Upstream draws without replacement when a patch
-    has enough points and otherwise pads with random replicas; in the F2S3 regime
-    patches hold far fewer points than ``samples_per_patch_lrf`` (heavy replication
-    either way), so the two are statistically equivalent. GeDi is not parity-gated,
-    so this RNG/device change is acceptable.
+    ``radius_neighborhoods`` returns the in-radius neighbour coords already centred
+    on the query (``neighbour - query``); GeDi's LRF centres internally by subtracting
+    its ``x0`` argument, so we pass ``x0 = 0`` — identical to feeding raw coords with
+    the real query centre. Patch points are sampled uniformly **with replacement**
+    from each query's in-radius set (statistically equivalent to upstream's
+    all+replica padding in the point-starved F2S3 regime; GeDi is not parity-gated).
 
     Args:
         gedi: a vendored ``GeDi`` instance (network + LRF already on CUDA).
@@ -103,42 +101,37 @@ def _gedi_compute_gpu(gedi, query_pts, search_pts):
     device = "cuda"
     spb = gedi.samples_per_batch
     sppl = gedi.samples_per_patch_lrf
+    r_lrf = gedi.r_lrf
     N = query_pts.shape[0]
+    # VRAM-bound: radius_neighborhoods builds [chunk, maxN, 3] (see gpu_extract).
+    CHUNK = 60000
 
-    pcd_t = torch.from_numpy(search_pts).float().to(device)          # [M, 3]
-    pts_t = torch.from_numpy(query_pts).float()
-
-    tree = cKDTree(search_pts)
-    neigh = tree.query_ball_point(query_pts, r=gedi.r_lrf, workers=-1)
+    gpu_index = gpu_extract.build_index(search_pts, r_lrf)
+    query_t = torch.from_numpy(query_pts).float().to(device)
 
     desc = np.empty((N, gedi.dim))
-    for b in range(int(np.ceil(N / spb))):
-        i0 = b * spb
-        i1 = min((b + 1) * spb, N)
-        batch = neigh[i0:i1]
+    for c0 in range(0, N, CHUNK):
+        c1 = min(c0 + CHUNK, N)
+        # ptall = full in-radius set (nearest kept), coords centred on the query.
+        _, _, _, ptall_coords, ptall_mask = gpu_extract.radius_neighborhoods(
+            gpu_index, query_t[c0:c1], r_lrf)
+        counts = ptall_mask.sum(dim=1).clamp(min=1)                 # [chunk]
 
-        cnt = np.fromiter((len(n) for n in batch), dtype=np.int64, count=i1 - i0)
-        cnt = np.clip(cnt, 1, None)
-        max_n = int(cnt.max())
+        for b0 in range(0, c1 - c0, spb):
+            b1 = min(b0 + spb, c1 - c0)
+            coords = ptall_coords[b0:b1]                            # [b, maxN, 3] centred
+            cnt = counts[b0:b1]                                     # [b]
+            # Uniform-with-replacement sample positions in [0, cnt) per query.
+            samp = (torch.rand(b1 - b0, sppl, device=device) * cnt[:, None]).long()
+            x_c = torch.gather(coords, 1, samp[..., None].expand(-1, -1, 3))  # [b, sppl, 3]
+            x = x_c.transpose(1, 2).contiguous()                   # [b, 3, sppl]
 
-        # Pad each query's neighbour-index list into a dense [b, max_n] matrix.
-        pad = np.zeros((i1 - i0, max_n), dtype=np.int64)
-        for k, n in enumerate(batch):
-            if len(n):
-                pad[k, :len(n)] = n
-        pad_t = torch.from_numpy(pad).to(device)                     # [b, max_n]
-        cnt_t = torch.from_numpy(cnt).to(device)                     # [b]
-
-        # Uniform-with-replacement sample positions in [0, cnt) per query.
-        samp = (torch.rand(i1 - i0, sppl, device=device) * cnt_t[:, None]).long()
-        gidx = torch.gather(pad_t, 1, samp)                          # [b, sppl] global idx
-        patch_pts = pcd_t[gidx]                                      # [b, sppl, 3]
-        x = patch_pts.transpose(1, 2).contiguous()                  # [b, 3, sppl]
-
-        patch = gedi.lrf(pts_t[i0:i1].to(device), x)                # GPU LRF -> [b, 3, out]
-        with torch.no_grad():
-            f = gedi.gedi_net(patch)
-        desc[i0:i1] = f.cpu().numpy()[:i1 - i0]
+            # coords are already centred -> pass zero query centres to the LRF.
+            x0 = torch.zeros(b1 - b0, 3, device=device)
+            patch = gedi.lrf(x0, x)                                 # GPU LRF -> [b, 3, out]
+            with torch.no_grad():
+                f = gedi.gedi_net(patch)
+            desc[c0 + b0:c0 + b1] = f.cpu().numpy()
 
     return desc
 
