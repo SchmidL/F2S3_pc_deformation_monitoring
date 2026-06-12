@@ -103,10 +103,9 @@ def _gedi_compute_gpu(gedi, query_pts, search_pts):
     sppl = gedi.samples_per_patch_lrf
     r_lrf = gedi.r_lrf
     N = query_pts.shape[0]
-    # VRAM-bound: radius_neighborhoods builds [chunk, maxN, 3] (see gpu_extract).
-    CHUNK = 60000
 
     gpu_index = gpu_extract.build_index(search_pts, r_lrf)
+    CHUNK = gpu_extract._adaptive_chunk_size(gpu_index, r_lrf)
     query_t = torch.from_numpy(query_pts).float().to(device)
 
     desc = np.empty((N, gedi.dim))

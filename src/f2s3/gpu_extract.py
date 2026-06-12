@@ -7,6 +7,49 @@ from torch.utils.dlpack import from_dlpack
 
 _EPS = 1e-6
 
+# VRAM budget for the padded [chunk, maxN, 3] + [chunk, maxN] tensors
+# produced by radius_neighborhoods (two sets: ptnn + ptall).
+# 4 GB leaves ~20 GB for the model, Open3D scratch, and overhead on a 24 GB card.
+_MAX_PAD_BYTES = 4 * 1024**3
+# Per-neighbour byte estimate: 2× (3×4 bytes coords + 1 byte mask + 4 bytes dist)
+# ~= 2 × 17 bytes = 34 bytes per slot.  Round up for allocation overhead.
+_BYTES_PER_SLOT = 40
+
+
+def _adaptive_chunk_size(gpu_index, feature_radius, n_samples=500):
+    """Probe ``maxN`` at the current radius and return a VRAM-safe chunk size.
+
+    Runs ``radius_neighborhoods`` on a small random sample, reads the
+    padded width (``maxN``) of the ptall set, and returns a chunk size
+    such that ``[chunk, maxN]`` padded coords stay within ``_MAX_PAD_BYTES``.
+
+    Args:
+        gpu_index: GpuNeighborIndex from ``build_index``.
+        feature_radius: float, search radius.
+        n_samples: number of query points to probe (default 500).
+
+    Returns:
+        int chunk size (clamped between 100 and 100 000).
+    """
+    n_total = gpu_index.positions.shape[0]
+    n_probe = min(n_samples, n_total)
+    if n_probe == 0:
+        return 100000
+    # Use a fixed seed for reproducible probing across backend runs.
+    rng = np.random.RandomState(42)
+    idx = rng.choice(n_total, size=n_probe, replace=False)
+    probe_pts = gpu_index.positions[idx].cpu().numpy().astype(np.float32)
+    _, _, _, ptall_coords, _ = radius_neighborhoods(
+        gpu_index, probe_pts, feature_radius)
+    max_n = ptall_coords.shape[1]
+    if max_n == 0:
+        return 100000
+    chunk = max(100, min(100000, int(_MAX_PAD_BYTES / (max_n * _BYTES_PER_SLOT))))
+    logging.info(
+        f"  Adaptive chunk size: maxN={max_n} at r={feature_radius:.2f} → "
+        f"chunk_size={chunk}")
+    return chunk
+
 
 class GpuNeighborIndex:
     """Thin container that holds an Open3D NearestNeighborSearch together
@@ -293,11 +336,7 @@ def gpu_extract_features(
     if Q == 0:
         return torch.zeros(0, 64, device=query_pts_t.device)
 
-    # VRAM-bound chunk size: radius_neighborhoods produces [chunk, maxN, 3]
-    # float32 tensors; with maxN up to ~2000 on the _small pair at
-    # r≈2.96.  Observed ~5.5 GB VRAM at 10 K chunks — 60 K keeps
-    # well under 24 GB (~12 GB estimated) and reduces chunk count 6×.
-    CHUNK_SIZE = 60000
+    CHUNK_SIZE = _adaptive_chunk_size(gpu_index, feature_radius)
 
     local_features = []
     for chunk_start in range(0, Q, CHUNK_SIZE):
