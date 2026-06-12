@@ -69,5 +69,10 @@ RUN python3 -m venv /opt/venv \
 
 ENV PATH="/opt/venv/bin:${PATH}"
 
+# NOTE: the optional GeDi descriptor (--descriptor gedi) additionally needs the
+# pointnet2_ops CUDA extension built against this image's CUDA/torch toolchain.
+# It is not installed here (the image is DIP-only by default); see
+# docs/installation.md ("Optional: GeDi feature descriptor") to add it.
+
 ENTRYPOINT ["f2s3"]
 CMD ["--help"]

@@ -36,11 +36,9 @@ from plotly.graph_objs.icicle import Pathbar
 from tqdm import tqdm
 from sklearn.neighbors import NearestNeighbors
 
-from .descriptor_model import PointNetFeature
 from .filtering_model import FilteringNetwork
-from .data import FeatureExtractionDataset
 from .utils import transform_point_cloud, compute_c2c
-from . import gpu_extract
+from .descriptors import build_descriptor
 
 from pc_tiling import pc_tiling
 from supervoxel import supervoxel
@@ -122,6 +120,8 @@ class F2S3RunSettings:
     verbose: bool = False
     extraction_backend: str = "gpu"
     extraction_seed: int = 41
+    descriptor: str = "dip"
+    gedi_r_lrf: float = 0.0
     filter_median_magnitude: bool = False
     refine_results: bool = False
     fill_gaps_c2c: bool = False
@@ -177,6 +177,12 @@ class F2S3RunSettings:
                 f"extraction_seed must be a non-negative integer, "
                 f"got {self.extraction_seed}"
             )
+        if self.descriptor not in {"dip", "gedi"}:
+            raise ValueError(
+                f"descriptor must be 'dip' or 'gedi', got {self.descriptor!r}"
+            )
+        if self.gedi_r_lrf < 0.0:
+            raise ValueError("gedi_r_lrf can't be negative!")
 
         # Prepare the logger
         logger = logging.getLogger()
@@ -198,7 +204,7 @@ class PointCloudTile:
     Base point cloud tile class. It implements all the functions needed for the robust estimation of the displacement vectors.
     """
 
-    def __init__(self, path_s: Path, path_t: Path, tile_id: str, feature_extractor, filtering_network, args: F2S3RunSettings):
+    def __init__(self, path_s: Path, path_t: Path, tile_id: str, descriptor, filtering_network, args: F2S3RunSettings):
         """
         Class constructor:
 
@@ -206,7 +212,7 @@ class PointCloudTile:
             path_s (str): path to the source point cloud
             path_t (str): path to the target point cloud
             tile_id (str): number of the current point cloud tile
-            feature_extractor (pytorch model): feature extractor model with loaded pretrained weights
+            descriptor (Descriptor): local-feature descriptor backend (DIP or GeDi) with loaded weights
             filtering_network (pytorch model): outlier filtering model with loaded pretrained weights
             args (dict): selected command line arguments
 
@@ -233,7 +239,7 @@ class PointCloudTile:
         # self.pcd_t_overlap = o3d.io.read_point_cloud(
         #     os.path.join(overlap_path, "overlap/target_tile_{}_overlap.ply".format(self.tile_id)))
 
-        self.feature_extractor = feature_extractor
+        self.descriptor = descriptor
         self.filtering_network = filtering_network
 
         self.extraction_backend = args.extraction_backend
@@ -312,9 +318,11 @@ class PointCloudTile:
 
     def compute_local_features(self):
         """
-        Computes local feature descriptors for each point in both source and target point cloud using DIP method proposed in [3]-
+        Computes local feature descriptors for each point in both source and target point cloud
+        using the configured descriptor backend: DIP [3] (default) or GeDi [5].
 
         [3] Poiesi, F., & Boscaini, D.: Distinctive 3D local deep descriptors. International Conference on Pattern Recognition (ICPR), 2020.
+        [5] Poiesi, F., & Boscaini, D.: Learning general and distinctive 3D local deep descriptors for point cloud registration. IEEE T-PAMI, 2022.
         """
 
         # Use the user-defined neighborhood radius if provided, otherwise derive it from the median resolution
@@ -330,76 +338,14 @@ class PointCloudTile:
                 f"Neighborhood radius: {neighborhood_radius:.3f}")
 
         start_time = time.time()
-        local_features_s = []
-        local_features_t = []
 
-        if self.extraction_backend == "cpu":
-            # ---------- CPU path (unchanged A/B oracle, D-02) ----------
-            # The FeatureExtractionDataset/DataLoader workers apply
-            # only to this cpu backend (Pitfall 5).
-            dataset_s = FeatureExtractionDataset(
-                self.pcd_s, self.pcd_s_overlap, self.batch_size,
-                neighborhood_radius)
-            dataset_t = FeatureExtractionDataset(
-                self.pcd_t, self.pcd_t_overlap, self.batch_size,
-                neighborhood_radius)
-            dataloader_s = torch.utils.data.DataLoader(
-                dataset_s, batch_size=1, shuffle=False, num_workers=6,
-                drop_last=False)
-            dataloader_t = torch.utils.data.DataLoader(
-                dataset_t, batch_size=1, shuffle=False, num_workers=6,
-                drop_last=False)
-
-            if self.verbose:
-                dataloader_s = tqdm(dataloader_s, ncols=90)
-            for batch in dataloader_s:
-                batch_feat = batch.squeeze(0).cuda()
-                batch_feat, _, _ = self.feature_extractor(batch_feat)
-                local_features_s.append(batch_feat)
-
-            if self.verbose:
-                dataloader_t = tqdm(dataloader_t, ncols=90)
-            for batch in dataloader_t:
-                batch_feat = batch.squeeze(0).cuda()
-                batch_feat, _, _ = self.feature_extractor(batch_feat)
-                local_features_t.append(batch_feat)
-
-        else:
-            # ---------- GPU path (default, D-02a) ----------
-            # The GPU backend builds its patches on-device via Open3D NNS
-            # and does NOT use the FeatureExtractionDataset/DataLoader
-            # workers.  QW-02/QW-03 knobs (num_workers, pin_memory,
-            # prefetch_factor) apply only to the cpu backend (Pitfall 5).
-
-            # Build one GPU index per overlap cloud (D-03/EXT-04)
-            s_overlap_np = np.asarray(self.pcd_s_overlap.points).astype(np.float32)
-            t_overlap_np = np.asarray(self.pcd_t_overlap.points).astype(np.float32)
-            gpu_idx_s = gpu_extract.build_index(s_overlap_np, neighborhood_radius)
-            gpu_idx_t = gpu_extract.build_index(t_overlap_np, neighborhood_radius)
-
-            # GPU resolution estimate (EXT-04 reuse)
-            s_query_np = np.asarray(self.pcd_s.points).astype(np.float32)
-            t_query_np = np.asarray(self.pcd_t.points).astype(np.float32)
-
-            # Source features
-            s_query_t = torch.from_numpy(s_query_np).cuda()
-            features_s = gpu_extract.gpu_extract_features(
-                s_query_t, gpu_idx_s, neighborhood_radius,
-                self.feature_extractor, self.batch_size,
-                self.extraction_seed, verbose=self.verbose)
-            local_features_s = [features_s]
-
-            # Target features
-            t_query_t = torch.from_numpy(t_query_np).cuda()
-            features_t = gpu_extract.gpu_extract_features(
-                t_query_t, gpu_idx_t, neighborhood_radius,
-                self.feature_extractor, self.batch_size,
-                self.extraction_seed, verbose=self.verbose)
-            local_features_t = [features_t]
-
-        # Save the features for the subsequent correspondence estimation
-        self.local_features_s = torch.cat(local_features_s, 0)
-        self.local_features_t = torch.cat(local_features_t, 0)
+        # Delegate per-cloud extraction to the selected descriptor backend. The
+        # backend builds its own patches (the cpu/gpu DIP paths, or GeDi's internal
+        # neighbour search + LRF) and returns an [N, dim] feature tensor.
+        self.local_features_s = self.descriptor.extract_features(
+            self.pcd_s, self.pcd_s_overlap, neighborhood_radius)
+        self.local_features_t = self.descriptor.extract_features(
+            self.pcd_t, self.pcd_t_overlap, neighborhood_radius)
 
         torch.cuda.empty_cache()
         gc.collect()
@@ -442,7 +388,7 @@ class PointCloudTile:
         start_time = time.time()
 
         # Intitialize the library, specify the space, the type of the vector and add data points
-        p = hnswlib.Index(space='l2', dim=64)  # possible options are l2, cosine or ip
+        p = hnswlib.Index(space='l2', dim=self.local_features_s.shape[1])  # possible options are l2, cosine or ip
         p.init_index(max_elements=self.local_features_t.shape[0], ef_construction=efC, M=M)
         p.set_ef(efS)
         p.set_num_threads(num_threads)
@@ -643,16 +589,11 @@ def feature_based_deformation_analysis(args: F2S3RunSettings):
     torch.backends.cudnn.allow_tf32 = True
     torch.backends.cudnn.benchmark = True
 
-    with resources.path('f2s3.pretrained_models.feature_descriptor', 'model_best.pth') as f_m:
-        f_m = Path(f_m)
     with resources.path('f2s3.pretrained_models.outlier_filtering', 'model_best.pt') as o_m:
         o_m = Path(o_m)
 
-    # Load the feature descriptor model
-    feature_descriptor = PointNetFeature()
-    feature_descriptor.load_state_dict(torch.load(f_m))
-    feature_descriptor.cuda()
-    feature_descriptor.eval()
+    # Build the selected feature descriptor backend (DIP default, or GeDi)
+    descriptor = build_descriptor(args)
 
     filtering_network = FilteringNetwork()
     filtering_network.load_state_dict(torch.load(o_m))
@@ -720,7 +661,7 @@ def feature_based_deformation_analysis(args: F2S3RunSettings):
 
         if tile_t.exists():
             try:
-                deformation_data = PointCloudTile(tile_s, tile_t, tile_nr, feature_descriptor, filtering_network, args)
+                deformation_data = PointCloudTile(tile_s, tile_t, tile_nr, descriptor, filtering_network, args)
 
                 start_time = time.time()
                 deformation_data.compute_local_features()

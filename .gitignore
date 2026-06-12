@@ -720,6 +720,12 @@ FodyWeavers.xsd
 
 # GSD planning docs (local-only)
 .planning/
+.claude/
+.opencode/
 
 # F2S3 harness regenerable baseline artifacts
 baseline/
+results/
+
+# GeDi standalone bring-up workspace (Stage 0, local-only)
+_dev_gedi/

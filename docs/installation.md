@@ -207,6 +207,45 @@ python -c "import torch; print(torch.version.cuda)"
 
 ---
 
+## 9. Optional: GeDi feature descriptor (`--descriptor gedi`)
+
+F2S3 defaults to the DIP descriptor and needs nothing extra. The alternative **GeDi**
+descriptor (selected with `--descriptor gedi`) is opt-in and has two additional
+requirements:
+
+1. **`torchgeometry`** — a plain pip dependency (already listed in `pyproject.toml`),
+   works as-is on modern PyTorch.
+2. **`pointnet2_ops`** — a CUDA extension that must be **compiled against the same CUDA
+   version your PyTorch was built with**. It is *not* installed automatically (no prebuilt
+   wheel) and is imported lazily, so DIP-only runs never need it.
+
+Build `pointnet2_ops` from the GeDi fork (`SchmidL/gedi`, branch `f2s3-torch27-bringup`,
+which patches the arch list for Ampere):
+
+```bash
+# Point CUDA_HOME at a toolkit matching `python -c "import torch; print(torch.version.cuda)"`
+# (e.g. 11.8 for a cu118 build), and set the arch for your GPU (sm_86 = RTX 3090 Ti).
+export CUDA_HOME=/usr/local/cuda-11.8
+export PATH=$CUDA_HOME/bin:$PATH
+export TORCH_CUDA_ARCH_LIST="8.6+PTX"
+
+git clone https://github.com/SchmidL/gedi.git
+pip install ./gedi/backbones/pointnet2_ops_lib/
+```
+
+Verify:
+
+```bash
+python -c "import pointnet2_ops, torchgeometry; print('GeDi deps OK')"
+```
+
+The GeDi 3DMatch checkpoint ships with the package
+(`pretrained_models/gedi/chkpt.tar`), so no separate download is required. By default
+GeDi's LRF radius follows the pipeline `neighborhood_radius`; override it with
+`--gedi_r_lrf` if needed for your data's metric scale.
+
+---
+
 # Troubleshooting
 
 This section helps diagnose common issues related to GPU support and environment setup.
