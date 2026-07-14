@@ -20,9 +20,15 @@ import torch
 from common import OUT_DIR, Tile, ensure_out, knn, tile_ids
 
 
+# This is the only source-vs-source search, so each chunk row spans all ~861k source
+# features: a chunk of C costs C x 861k x 4 bytes. C=8192 would ask for ~28 GB and OOM
+# on a 24 GB card, so keep it small here.
+CHUNK = 512
+
+
 def run_tile(tile):
     # k=2: the first neighbour is the point itself (distance 0), so take the second.
-    D, _ = knn(tile.feat_s, tile.feat_s, k=2)
+    D, _ = knn(tile.feat_s, tile.feat_s, k=2, chunk=CHUNK)
     d_self1 = D[:, 1]
 
     eps = 0.1 * float(np.median(d_self1))
@@ -31,11 +37,10 @@ def run_tile(tile):
     q = torch.as_tensor(tile.feat_s, dtype=torch.float32,
                         device='cuda' if torch.cuda.is_available() else 'cpu')
     n_eps = np.empty(tile.n_src, dtype=np.int32)
-    chunk = 4096
-    for s in range(0, q.shape[0], chunk):
-        dist = torch.cdist(q[s:s + chunk], q)
+    for s in range(0, q.shape[0], CHUNK):
+        dist = torch.cdist(q[s:s + CHUNK], q)
         # subtract 1 to exclude the self-match
-        n_eps[s:s + chunk] = ((dist <= eps).sum(dim=1) - 1).cpu().numpy()
+        n_eps[s:s + CHUNK] = ((dist <= eps).sum(dim=1) - 1).cpu().numpy()
 
     return d_self1, n_eps, eps
 
