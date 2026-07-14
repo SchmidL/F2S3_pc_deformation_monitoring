@@ -33,6 +33,10 @@ def main():
     parser.add_argument('--neighborhood_radius', type=float, default=argparse.SUPPRESS,
         help='Neighborhood radius for local feature extraction. Overrides the default '
              'sqrt(3) * 10 * median_resolution (auto-derived if 0)')
+    parser.add_argument('--supervoxel_radius', type=float, default=argparse.SUPPRESS,
+        help='Fixed supervoxel radius in meters (unit of local-consistency filtering). '
+             'Overrides the default max(sqrt(3)*10*median_resolution, voxel_grid_size). '
+             'Derived automatically if 0.')
     parser.add_argument('--extraction_backend', type=str, default=argparse.SUPPRESS,
         help='Extraction backend for local feature patch construction: "gpu" (default) '
              'or "cpu" (the original DataLoader/CPU-extract path). '

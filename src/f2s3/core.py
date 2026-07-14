@@ -116,6 +116,7 @@ class F2S3RunSettings:
     voxel_grid_size: float = 0.0
     max_disp_magnitude: float = 0.0
     neighborhood_radius: float = 0.0
+    supervoxel_radius: float = 0.0 
     save_interim: bool = False
     verbose: bool = False
     extraction_backend: str = "gpu"
@@ -167,6 +168,8 @@ class F2S3RunSettings:
             raise ValueError("Maximum displacement magnitude can't be negative!")
         if self.neighborhood_radius < 0.0:
             raise ValueError("Neighborhood radius can't be negative!")
+        if self.supervoxel_radius < 0.0:
+            raise ValueError("Supervoxel radius can't be negative!")
         if self.extraction_backend not in {"cpu", "gpu"}:
             raise ValueError(
                 f"extraction_backend must be 'cpu' or 'gpu', "
@@ -253,6 +256,7 @@ class PointCloudTile:
         self.base_save_path = args.results_dir
         self.voxel_grid_size = args.voxel_grid_size
         self.neighborhood_radius = args.neighborhood_radius
+        self.supervoxel_radius = args.supervoxel_radius
         self.batch_size = args.batch_size
 
         # Compute median resolution of the point clouds
@@ -271,7 +275,10 @@ class PointCloudTile:
         # Approximate supervoxel radius is defined for each tile independently based on the median point cloud resolution
         # I changes please consider that this has to be a reasonable value (i.e. size of the patch that moves as rigid body)
 
-        supervoxel_radius = np.max((_radius_from_resolution(self.median_resolution), self.voxel_grid_size,))
+        if self.supervoxel_radius > 0.0:
+            supervoxel_radius = self.supervoxel_radius
+        else:
+            supervoxel_radius = np.max((_radius_from_resolution(self.median_resolution), self.voxel_grid_size))
 
         if self.verbose:
             logging.info('Starting the supervoxel ectraction.')
