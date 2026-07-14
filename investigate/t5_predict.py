@@ -51,59 +51,81 @@ def main():
     for tid in tile_ids():
         tile = Tile(tid)
         metrics = load_metrics(tid)
-        y = tile.is_outlier
-        print(f'{tile}\n  outliers (|v|>={OUTLIER_M:g} m): {y.sum()} / {len(y)} ({y.mean():.2%})')
+        print(tile)
 
-        rows = []
-        for name, v in metrics.items():
-            a = auc(v, y)
-            # a metric that predicts the *absence* of outliers is just as useful,
-            # so report the strength of separation either way
-            rows.append((name, a, max(a, 1 - a)))
-        rows.sort(key=lambda r: -r[2])
+        # Two targets, because they answer different questions.
+        #   RAW: did the matcher pick a wrong partner at all? Tests the ambiguity
+        #        mechanism directly, over every source point.
+        #   RESIDUAL: among the points the supervoxel filter kept, which are still
+        #        gross outliers? These are the blobs left in the plotted field, and
+        #        this is the target any new filter has to actually beat.
+        targets = {
+            'raw (all pts, |v|>=40 m)': (tile.is_outlier, np.ones(tile.n_src, dtype=bool)),
+            'residual (survivors only)': (tile.residual_outlier, tile.survived),
+        }
+
+        all_rows = {}
+        for tname, (y, sub) in targets.items():
+            ysub = y[sub]
+            print(f'\n  target: {tname}   base rate {ysub.mean():.2%} '
+                  f'({ysub.sum()} / {sub.sum()})')
+            rows = []
+            for name, v in metrics.items():
+                a = auc(v[sub], ysub)
+                # a metric predicting the ABSENCE of outliers is equally useful,
+                # so also report separation strength regardless of orientation
+                rows.append((name, a, max(a, 1 - a)))
+            rows.sort(key=lambda r: -r[2])
+            all_rows[tname] = rows
+            print(f'  {"metric":<26} {"AUC":>7} {"separability":>13}')
+            for name, a, sep in rows:
+                print(f'  {name:<26} {a:>7.3f} {sep:>13.3f}')
 
         csv_path = os.path.join(OUT_DIR, f't5_auc_tile_{tid}.csv')
         with open(csv_path, 'w', newline='') as f:
             w = csv.writer(f)
-            w.writerow(['metric', 'auc', 'separability'])
-            for name, a, sep in rows:
-                w.writerow([name, f'{a:.4f}', f'{sep:.4f}'])
+            w.writerow(['target', 'metric', 'auc', 'separability'])
+            for tname, rows in all_rows.items():
+                for name, a, sep in rows:
+                    w.writerow([tname, name, f'{a:.4f}', f'{sep:.4f}'])
 
-        print(f'  {"metric":<26} {"AUC":>7} {"separability":>13}')
-        for name, a, sep in rows:
-            print(f'  {name:<26} {a:>7.3f} {sep:>13.3f}')
+        fig, axes = plt.subplots(2, 2, figsize=(16, 11))
+        for row, (tname, (y, sub)) in enumerate(targets.items()):
+            ysub = y[sub]
+            ax = axes[row]
+            pct = np.arange(0, 100, 5)
+            for name, v in metrics.items():
+                vs = v[sub]
+                edges = np.percentile(vs, np.append(pct, 100))
+                rate = []
+                for i in range(len(pct)):
+                    lo, hi = edges[i], edges[i + 1]
+                    m = (vs >= lo) & (vs <= hi) if i == len(pct) - 1 else (vs >= lo) & (vs < hi)
+                    rate.append(ysub[m].mean() if m.sum() else np.nan)
+                ax[0].plot(pct + 2.5, np.array(rate) * 100, '-o', ms=3, label=name)
+            ax[0].axhline(ysub.mean() * 100, color='k', ls=':', label='base rate')
+            ax[0].set_xlabel('metric percentile (higher = more ambiguous)')
+            ax[0].set_ylabel('outlier rate [%]')
+            ax[0].set_title(f'T5 outlier rate vs percentile\ntarget: {tname}')
+            ax[0].legend(fontsize=7)
 
-        # outlier rate vs metric percentile
-        fig, ax = plt.subplots(1, 2, figsize=(15, 5.5))
-        pct = np.arange(0, 100, 5)
-        for name, v in metrics.items():
-            edges = np.percentile(v, np.append(pct, 100))
-            rate = []
-            for i in range(len(pct)):
-                lo, hi = edges[i], edges[i + 1]
-                m = (v >= lo) & (v <= hi) if i == len(pct) - 1 else (v >= lo) & (v < hi)
-                rate.append(y[m].mean() if m.sum() else np.nan)
-            ax[0].plot(pct + 2.5, np.array(rate) * 100, '-o', ms=3, label=name)
-        ax[0].axhline(y.mean() * 100, color='k', ls=':', label='base rate')
-        ax[0].set_xlabel('metric percentile (higher = more ambiguous)')
-        ax[0].set_ylabel(f'outlier rate [%]  (|v| >= {OUTLIER_M:g} m)')
-        ax[0].set_title(f'T5 outlier rate vs metric percentile, tile {tid}')
-        ax[0].legend(fontsize=8)
+            rows = all_rows[tname]
+            names = [r[0] for r in rows][::-1]
+            seps = [r[2] for r in rows][::-1]
+            cols = ['seagreen' if s > 0.7 else 'goldenrod' if s > 0.6 else 'indianred'
+                    for s in seps]
+            ax[1].barh(names, seps, color=cols)
+            ax[1].axvline(0.5, color='k', ls=':', label='no separation')
+            ax[1].set_xlim(0.5, 1.0)
+            ax[1].set_xlabel('separability (AUC, orientation-corrected)')
+            ax[1].set_title(f'T5 metric ranking\ntarget: {tname}')
+            ax[1].legend()
 
-        names = [r[0] for r in rows][::-1]
-        seps = [r[2] for r in rows][::-1]
-        cols = ['seagreen' if s > 0.7 else 'goldenrod' if s > 0.6 else 'indianred' for s in seps]
-        ax[1].barh(names, seps, color=cols)
-        ax[1].axvline(0.5, color='k', ls=':', label='no separation')
-        ax[1].set_xlim(0.5, 1.0)
-        ax[1].set_xlabel('separability (AUC, orientation-corrected)')
-        ax[1].set_title('T5 which metric best separates the outliers?')
-        ax[1].legend()
-
+        fig.suptitle(f'T5 do the ambiguity metrics predict the outliers? tile {tid}', y=1.0)
         fig.tight_layout()
         fig.savefig(os.path.join(OUT_DIR, f't5_predict_tile_{tid}.png'), dpi=130)
         plt.close(fig)
-        print(f'  -> {OUT_DIR}/t5_predict_tile_{tid}.png  and  {csv_path}')
+        print(f'\n  -> {OUT_DIR}/t5_predict_tile_{tid}.png  and  {csv_path}')
 
 
 if __name__ == '__main__':

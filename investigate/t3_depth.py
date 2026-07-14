@@ -35,7 +35,7 @@ def main():
         d = {f'depth_{e:g}': depths(Dk, e) for e in EPSILONS}
         np.savez_compressed(os.path.join(OUT_DIR, f't3_tile_{tid}.npz'), **d)
 
-        inl, out = tile.is_inlier, tile.is_outlier
+        inl, out = tile.trusted, tile.residual_outlier
         for e in EPSILONS:
             v = d[f'depth_{e:g}']
             print(f'  eps={e:.2f}: median {np.median(v):.0f}  '
@@ -56,8 +56,8 @@ def main():
 
         main_eps = 0.10
         v = d[f'depth_{main_eps:g}']
-        for mask, lab, col in ((inl, 'trusted (|v|<15 m)', 'seagreen'),
-                               (out, 'gross outlier (|v|>=40 m)', 'crimson')):
+        for mask, lab, col in ((inl, 'trusted (survived, |v|<15 m)', 'seagreen'),
+                               (out, 'residual outlier (survived, |v|>=40 m)', 'crimson')):
             if mask.sum() == 0:
                 continue
             ax[1].hist(v[mask], bins=np.arange(1, K + 2) - 0.5, histtype='step', lw=2,

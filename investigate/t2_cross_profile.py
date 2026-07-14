@@ -43,9 +43,11 @@ def main():
         np.savez_compressed(os.path.join(OUT_DIR, f't2_tile_{tid}.npz'),
                             d1=d1, r2=r2, r10=r10, flatness=flatness)
 
-        inl, out = tile.is_inlier, tile.is_outlier
-        print(f'  |v|<{INLIER_M:g}m: {inl.sum()} pts   |v|>={OUTLIER_M:g}m: {out.sum()} pts '
-              f'({out.mean():.2%})')
+        # compare the field the user actually plots: survivors of the supervoxel filter,
+        # split into the trusted ones and the residual blobs
+        inl, out = tile.trusted, tile.residual_outlier
+        print(f'  trusted (survived, |v|<{INLIER_M:g}m): {inl.sum()} pts   '
+              f'residual outliers (survived, |v|>={OUTLIER_M:g}m): {out.sum()} pts')
         print(f'  r2   mean: inliers {r2[inl].mean():.3f}  outliers {r2[out].mean():.3f}')
         print(f'  r10  mean: inliers {r10[inl].mean():.3f}  outliers {r10[out].mean():.3f}')
 
@@ -59,8 +61,9 @@ def main():
         fig.colorbar(h[3], ax=ax[0], label='count')
 
         ranks = np.arange(1, K + 1)
-        for mask, lab, col in ((inl, f'|v| < {INLIER_M:g} m (trusted)', 'seagreen'),
-                               (out, f'|v| >= {OUTLIER_M:g} m (gross outlier)', 'crimson')):
+        for mask, lab, col in ((inl, f'trusted (|v| < {INLIER_M:g} m)', 'seagreen'),
+                               (out, f'residual outlier (|v| >= {OUTLIER_M:g} m)', 'crimson'),
+                               (~tile.survived, 'rejected by supervoxel filter', 'slategrey')):
             if mask.sum() == 0:
                 continue
             prof = Dk[mask].mean(axis=0)

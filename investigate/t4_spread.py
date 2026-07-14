@@ -74,11 +74,11 @@ def main():
                             spread=spread_max, spread_std=spread_std)
 
         extent = np.linalg.norm(tile.xyz_t.max(axis=0) - tile.xyz_t.min(axis=0))
-        inl, out = tile.is_inlier, tile.is_outlier
+        inl, out = tile.trusted, tile.residual_outlier
         print(f'  tile diagonal ~ {extent:.1f} m')
         print(f'  spread  median {np.median(spread_max):.1f} m   p90 {np.percentile(spread_max, 90):.1f} m')
         print(f'  spread  mean: trusted {spread_max[inl].mean():.1f} m   '
-              f'outlier {spread_max[out].mean():.1f} m')
+              f'residual outlier {spread_max[out].mean():.1f} m')
 
         fig = plt.figure(figsize=(17, 10))
         ax0 = fig.add_subplot(2, 2, 1)

@@ -69,16 +69,26 @@ def main():
         print(tile)
         Dk, Ik = cross_knn_cached(tile, k=K)
         filters = build_filters(tile, Dk, Ik)
-        y = tile.is_outlier
+        y = tile.mag >= OUTLIER_M
 
         rows = []
         for name, (fam, keep) in filters.items():
-            n = int(keep.sum())
+            # The supervoxel filter is not going away: a feature-space filter would sit
+            # in FRONT of it, so what the user ends up plotting is the intersection.
+            # Density is quoted against all source points, so it is comparable to the
+            # 21.9 % the supervoxel filter alone retains.
+            final = keep & tile.survived
+            n = int(final.sum())
             dens = 100.0 * n / tile.n_src
-            orate = 100.0 * y[keep].mean() if n else float('nan')
-            med = float(np.median(tile.mag[keep])) if n else float('nan')
+            orate = 100.0 * y[final].mean() if n else float('nan')
+            med = float(np.median(tile.mag[final])) if n else float('nan')
+            # feature filter acting alone on the raw 1-NN field, for reference
+            n_raw = int(keep.sum())
+            orate_raw = 100.0 * tile.is_outlier[keep].mean() if n_raw else float('nan')
             rows.append(dict(filter=name, family=fam, retained_pct=dens, n_kept=n,
-                             outlier_pct=orate, median_mag=med))
+                             outlier_pct=orate, median_mag=med,
+                             raw_retained_pct=100.0 * n_raw / tile.n_src,
+                             raw_outlier_pct=orate_raw))
 
         csv_path = os.path.join(OUT_DIR, f't6_pareto_tile_{tid}.csv')
         with open(csv_path, 'w', newline='') as f:
@@ -88,10 +98,13 @@ def main():
                 w.writerow({k: (f'{v:.3f}' if isinstance(v, float) else v)
                             for k, v in r.items()})
 
-        print(f'  {"filter":<34} {"kept %":>7} {"outlier %":>10} {"med |v|":>9}')
+        print('  (filter AND supervoxel filter; density vs all source points)')
+        print(f'  {"filter":<34} {"kept %":>7} {"outlier %":>10} {"med |v|":>9} '
+              f'{"raw out %":>10}')
         for r in sorted(rows, key=lambda r: r['outlier_pct']):
             print(f'  {r["filter"]:<34} {r["retained_pct"]:>7.1f} '
-                  f'{r["outlier_pct"]:>10.2f} {r["median_mag"]:>9.2f}')
+                  f'{r["outlier_pct"]:>10.2f} {r["median_mag"]:>9.2f} '
+                  f'{r["raw_outlier_pct"]:>10.1f}')
 
         fig, ax = plt.subplots(figsize=(10, 7))
         cols = {'baseline': 'black', 'ratio': 'tab:blue', 'mutual': 'tab:orange',

@@ -3,9 +3,24 @@
 All tasks operate on the interim data written by `f2s3 --save_interim`:
     features/features_tile_{T}_{R}.npz        feat_s, feat_t, xyz_s, xyz_t
     correspondences/correspondences_tile_{T}.npz   corr [Ns,6]
-    output/results/displacement_magnitude_tile_{T}.txt   [Ns,7]
+    output/results/displacement_magnitude_tile_{T}.txt   [Nk,7]
 
-Row i of feat_s / corr / the output txt all refer to the same source point.
+IMPORTANT - row alignment. feat_s, xyz_s and corr are row-aligned per source
+point. The output txt is NOT: `filter_correspondences` writes only the points
+that survived the supervoxel filter, reordered by supervoxel
+(core.py: save_coords[inlier_idx]). For the sample tile that is 189k of 861k
+source points. So we do not read magnitudes from the txt at all - we recompute
+the raw 1-NN magnitude straight from `corr`, which is row-aligned by
+construction, and separately remap the txt back onto source rows (exact 6-D
+coordinate match) to recover which points survived the filter.
+
+That gives two distinct fields, and the distinction matters:
+
+    mag        raw 1-NN displacement, every source point. What the *matcher*
+               produced, before any filtering. This is what descriptor
+               ambiguity acts on directly.
+    survived   the subset the supervoxel filter kept - the field actually
+               plotted, ~7.6 m median with ~4.6 % residual gross outliers.
 """
 
 import glob
@@ -15,8 +30,13 @@ import re
 import numpy as np
 import torch
 
-RESULTS_DIR = os.environ.get('F2S3_RESULTS', 'results/TCH_gedi_r6_investigate')
-OUT_DIR = os.environ.get('F2S3_INVEST_OUT', 'investigate/out')
+_HERE = os.path.dirname(os.path.abspath(__file__))
+
+RESULTS_DIR = os.environ.get(
+    'F2S3_RESULTS', os.path.join(_HERE, os.pardir, 'results', 'TCH_gedi_r6_investigate'))
+# anchored to this file, so the outputs land in investigate/out no matter where
+# the scripts are invoked from
+OUT_DIR = os.environ.get('F2S3_INVEST_OUT', os.path.join(_HERE, 'out'))
 
 # A displacement of at least this magnitude is treated as a gross outlier.
 OUTLIER_M = 40.0
@@ -66,15 +86,42 @@ class Tile:
             f'displacement_magnitude_tile_{tile_id}.txt'))
 
         self.xyz_s = self.corr[:, :3].astype(np.float32)
-        self.mag = self.out[:, 6].astype(np.float32)
 
         n = self.feat_s.shape[0]
         assert self.corr.shape[0] == n, 'corr rows != feat_s rows'
-        assert self.out.shape[0] == n, 'output rows != feat_s rows'
-        assert np.allclose(self.corr[:, :3], self.out[:, :3], atol=1e-3), \
-            'source coords in corr and output txt disagree'
         if self.xyz_t is not None:
             assert self.xyz_t.shape[0] == self.feat_t.shape[0], 'xyz_t rows != feat_t rows'
+        # the 1-NN target coords in corr must be rows of xyz_t
+        assert np.allclose(self.corr[:, :3], self.xyz_s, atol=1e-5)
+
+        # raw 1-NN displacement, row-aligned with feat_s (float64: metre-scale values,
+        # and the remap assert below compares against the float64 txt)
+        self.mag = np.linalg.norm(self.corr[:, 3:6] - self.corr[:, 0:3], axis=1)
+
+        self.survived = self._remap_survivors()
+
+    def _remap_survivors(self):
+        """Boolean mask over source rows: did this point survive the supervoxel filter?
+
+        The txt rows are exact copies of `corr` rows, so a 6-D exact match recovers
+        the source index. (Matching on source xyz alone is not safe: 66 source points
+        in the sample tile share coordinates with another point.)
+        """
+        def key(a):
+            a = np.ascontiguousarray(a, dtype=np.float64)
+            return a.view([('', a.dtype)] * a.shape[1]).ravel()
+
+        kc, ko = key(self.corr[:, :6]), key(self.out[:, :6])
+        order = np.argsort(kc)
+        pos = np.searchsorted(kc[order], ko)
+        hit = order[np.clip(pos, 0, len(kc) - 1)]
+        ok = kc[hit] == ko
+        assert ok.all(), 'some output rows did not match a correspondence row'
+        # magnitudes must agree exactly, which proves the remap is right
+        assert np.abs(self.mag[hit] - self.out[:, 6]).max() < 1e-6, 'remap magnitude mismatch'
+        m = np.zeros(self.n_src, dtype=bool)
+        m[hit] = True
+        return m
 
     @property
     def n_src(self):
@@ -86,15 +133,30 @@ class Tile:
 
     @property
     def is_outlier(self):
+        """Gross outlier in the RAW 1-NN field (before the supervoxel filter)."""
         return self.mag >= OUTLIER_M
 
     @property
     def is_inlier(self):
         return self.mag < INLIER_M
 
+    @property
+    def trusted(self):
+        """Survived the supervoxel filter AND has a plausible magnitude."""
+        return self.survived & (self.mag < INLIER_M)
+
+    @property
+    def residual_outlier(self):
+        """Survived the supervoxel filter and is STILL a gross outlier.
+
+        These are the clustered blobs that remain in the plotted field.
+        """
+        return self.survived & (self.mag >= OUTLIER_M)
+
     def __repr__(self):
         return (f'Tile({self.tile_id}: Ns={self.n_src} Nt={self.n_tgt} '
-                f'D={self.feat_s.shape[1]} xyz_t={"yes" if self.xyz_t is not None else "no"})')
+                f'D={self.feat_s.shape[1]} xyz_t={"yes" if self.xyz_t is not None else "no"} '
+                f'survived={self.survived.sum()} ({self.survived.mean():.1%}))')
 
 
 def knn(query, db, k, chunk=8192, device=DEVICE):
