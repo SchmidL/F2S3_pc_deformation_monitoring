@@ -375,7 +375,8 @@ class PointCloudTile:
 
             np.savez(os.path.join(save_path, 'features_tile_{}_{:.1f}.npz'.format(
                         self.tile_id, _radius_from_resolution(self.median_resolution))),
-                     feat_s=self.local_features_s.cpu(), feat_t=self.local_features_t.cpu())
+                     feat_s=self.local_features_s.cpu(), feat_t=self.local_features_t.cpu(),
+                     xyz_s=np.asarray(self.pcd_s.points), xyz_t=np.asarray(self.pcd_t.points))
 
     def compute_correspondences(self):
         """
