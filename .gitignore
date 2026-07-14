@@ -718,7 +718,7 @@ FodyWeavers.xsd
 # Built Visual Studio Code Extensions
 *.vsix
 
-# GSD planning docs (local-only)
+# Planning docs and local agent config (local-only)
 .planning/
 .claude/
 .opencode/
