@@ -4,6 +4,67 @@ Run: `results/TCH_gedi_r6_investigate`, TCH sample pair (20210924 → 20220831),
 `--voxel_grid_size 0.2 --neighborhood_radius 6 --supervoxel_radius 4 --descriptor gedi`.
 One tile: 861,552 source points, 775,358 target points, GeDi D=32.
 
+## The question
+
+The tuned field is much cleaner than before, but ~4.6 % of the plotted vectors are still gross
+outliers (≥ 40 m), and they sit in **clustered blobs** on low-texture ice/snow. The matcher is
+pure 1-NN in feature space with no ambiguity rejection. The hypothesis: on self-similar ice the
+GeDi descriptor is **not distinctive**, so for many source points a whole *neighbourhood* of
+target features is near-tied — not just the 2nd-best — and a classical Lowe ratio test (which
+only looks at d1/d2) cannot see that. The six tasks each probe one facet of that claim and then
+test whether a smarter filter can reach a dense *and* clean field.
+
+Each task writes a `.png` (diagnostic plots) and a `.npz`/`.csv` (per-point metrics) into
+`investigate/out/`, keyed by source-point row so later tasks can join them. Two point groups
+recur: **trusted** = survived the supervoxel filter with |v| < 15 m; **residual outlier** =
+survived but still |v| ≥ 40 m (the blobs actually left in the field).
+
+## What each task investigated
+
+- **T1 — Descriptor collapse (`t1_collapse.py`).** *Are the source descriptors themselves
+  degenerate?* For every source feature it finds the nearest *other* source feature (`d_self1`)
+  and counts how many lie within a tiny radius (`n_eps`). Large regions of near-zero `d_self1`
+  would mean GeDi literally emits the same vector across the ice. This is a source-vs-source
+  check — it never looks at the target — so it isolates "the descriptor is degenerate" from "the
+  match is ambiguous". **Result: negative** — no collapse, descriptors are individually distinct.
+
+- **T2 — Cross distance profile (`t2_cross_profile.py`).** *How sharply does the best target
+  match stand out?* Computes the top-20 feature matches from each source into the target
+  (`knn(feat_s, feat_t, k=20)`) and, per point, the classical Lowe ratio `r2 = d1/d2`, the deeper
+  `r10 = d1/d10`, and `flatness = (d10−d1)/d1`. The key plot is the mean distance profile d1…d20
+  for trusted vs outlier points: a **flat** profile means all 20 candidates are near-equidistant.
+  This task builds the cross-kNN cache that T3–T6 reuse.
+
+- **T3 — Ambiguity depth (`t3_depth.py`).** *How many candidates are effectively tied for first?*
+  `depth_eps = #{ j : d_j ≤ (1+eps)·d1 }` for eps ∈ {0.05, 0.1, 0.2}. This is precisely what a
+  k=2 ratio test cannot measure: depth ≫ 2 means a near-tied cluster, not a single close runner-up.
+  Plotted as a histogram and as a spatial map over the source cloud.
+
+- **T4 — Spatial spread of the top-k matches (`t4_spread.py`).** *Where do the candidate matches
+  land in space?* Maps the top-10 feature matches back to target coordinates (`xyz_t[Ik]`) and
+  measures how far apart they are (max pairwise distance). A distinctive point's candidates
+  cluster near the true partner (small spread); an ambiguous point's candidates scatter across the
+  whole tile (spread ≈ tile diameter). This is the one *geometric* ambiguity measure — it needs
+  the `xyz_t` patch — and it includes example "fan" plots of a distinctive vs an ambiguous point.
+
+- **T5 — Do the metrics predict the outliers? (`t5_predict.py`).** *Which measure best separates
+  good matches from blobs?* Joins every per-point metric (r2, r10, flatness, depth, spread, n_eps,
+  d1) to the gross-outlier flag and scores each by AUC, against two targets: the **raw** 1-NN field
+  (did the matcher fail at all?) and the **residual** survivors (which blobs leak through the
+  supervoxel filter?). Delivers the ranked "which metric wins" table.
+
+- **T6 — Offline filter simulation (`t6_filters.py`).** *What field would each candidate filter
+  actually produce?* Each filter (ratio, mutual-NN, depth, spread, and combinations) is a boolean
+  mask, so the field can be recomputed offline without re-running F2S3. Because any feature filter
+  sits **in front of** the supervoxel filter, it reports the intersection of the two, and plots
+  retained density vs outlier rate as a Pareto curve. The knee is the operating point that hits the
+  outlier target at maximum density.
+
+A note on why T5 and T6 can disagree: T5's AUC scores a metric's *global* ranking across all
+points, while T6 scores a *thresholded* filter at its actual operating point. A metric that is
+useless across most of its range but nearly pure in one tail (spread) scores poorly on AUC yet
+makes an excellent filter — see §3.
+
 ## 0. A correction to the brief
 
 The handoff's §8 assert (`feat_s.shape[0] == corr.shape[0] == out.shape[0]`) is **wrong**,
