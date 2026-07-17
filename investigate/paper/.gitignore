@@ -1,0 +1,6 @@
+*.aux
+*.log
+*.out
+*.toc
+page-*.png
+figures/*-1.png
