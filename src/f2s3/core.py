@@ -115,6 +115,8 @@ class F2S3RunSettings:
     batch_size: int = 1000
     voxel_grid_size: float = 0.0
     max_disp_magnitude: float = 0.0
+    max_search_distance: float = 0.0
+    search_candidates: int = 20
     neighborhood_radius: float = 0.0
     supervoxel_radius: float = 0.0 
     save_interim: bool = False
@@ -166,6 +168,10 @@ class F2S3RunSettings:
             raise ValueError("Voxel grid size can't be negative!")
         if self.max_disp_magnitude < 0.0:
             raise ValueError("Maximum displacement magnitude can't be negative!")
+        if self.max_search_distance < 0.0:
+            raise ValueError("Maximum search distance can't be negative!")
+        if self.search_candidates < 1:
+            raise ValueError("Number of search candidates needs to be a positive integer!")
         if self.neighborhood_radius < 0.0:
             raise ValueError("Neighborhood radius can't be negative!")
         if self.supervoxel_radius < 0.0:
@@ -249,6 +255,8 @@ class PointCloudTile:
         self.extraction_seed = args.extraction_seed
         self.refine_results = args.refine_results
         self.max_disp_magnitude = args.max_disp_magnitude
+        self.max_search_distance = args.max_search_distance
+        self.search_candidates = args.search_candidates
         self.filter_median_magnitude = args.filter_median_magnitude
         self.fill_gaps_c2c = args.fill_gaps_c2c
         self.verbose = args.verbose
@@ -264,6 +272,11 @@ class PointCloudTile:
 
         # Numbers of points used to compute the normal vectors in the supervoxel computation
         self.n_normals = 30
+
+        # Per-point mask of the correspondences that satisfy the spatial constraint. Stays None when
+        # the constraint is disabled, in which case every correspondence is used.
+        self.corr_valid = None
+        self.corr_rank = None
 
     def compute_supervoxels(self):
         """
@@ -378,6 +391,51 @@ class PointCloudTile:
                      feat_s=self.local_features_s.cpu(), feat_t=self.local_features_t.cpu(),
                      xyz_s=np.asarray(self.pcd_s.points), xyz_t=np.asarray(self.pcd_t.points))
 
+    def _apply_spatial_constraint(self, labels, xyz_s, xyz_t, chunk_size=200000):
+        """
+        Select, per source point, the highest-ranked feature-space candidate whose target position
+        lies within ``max_search_distance`` of the source position.
+
+        The candidates are already ordered by feature distance, so walking them in order and taking
+        the first spatially plausible one keeps the feature-space ranking and only rejects matches
+        that would imply an implausible displacement. Points without any plausible candidate keep
+        their nearest-neighbor index (to preserve the row alignment of ``self.correspondences`` with
+        the source cloud) but are flagged as invalid and excluded from the outlier filtering.
+
+        Args:
+            labels (np array): [n,k] indices of the k nearest neighbors in the feature space
+            xyz_s (np array): [n,3] coordinates of the source points
+            xyz_t (np array): [m,3] coordinates of the target points
+            chunk_size (int): number of source points processed per chunk (bounds the peak memory)
+
+        Returns:
+            match_idx (np array): [n] index of the selected target point per source point
+            valid (np array): [n] bool, True if a candidate within the distance budget was found
+            rank (np array): [n] rank of the selected candidate (0 = feature-space nearest neighbor)
+        """
+        n_points = labels.shape[0]
+        match_idx = np.empty(n_points, dtype=np.int64)
+        valid = np.empty(n_points, dtype=bool)
+        rank = np.zeros(n_points, dtype=np.int32)
+
+        for start in range(0, n_points, chunk_size):
+            end = min(start + chunk_size, n_points)
+            labels_chunk = labels[start:end, :].astype(np.int64)
+
+            # [c,k,3] candidate positions and their distance to the source point
+            candidates = xyz_t[labels_chunk.reshape(-1), :].reshape(labels_chunk.shape + (3,))
+            candidate_dist = np.linalg.norm(candidates - xyz_s[start:end, None, :], axis=2)
+
+            within = candidate_dist <= self.max_search_distance
+
+            # argmax returns the first True, or 0 if there is none (masked out via valid)
+            best_rank = np.argmax(within, axis=1)
+            valid[start:end] = np.any(within, axis=1)
+            rank[start:end] = best_rank
+            match_idx[start:end] = labels_chunk[np.arange(end - start), best_rank]
+
+        return match_idx, valid, rank
+
     def compute_correspondences(self):
         """
         Approximate correspondence search in the feature space using the hierarchical navigable small world graph method proposed in [4].
@@ -399,6 +457,16 @@ class PointCloudTile:
 
         start_time = time.time()
 
+        # Without a spatial constraint the single nearest neighbor in the feature space is the match.
+        # With one, more candidates are retrieved so that an ambiguous point can fall back to a
+        # lower-ranked but spatially plausible candidate instead of emitting a blunder.
+        if self.max_search_distance > 0.0:
+            # ef has to be at least as large as the number of requested neighbors
+            k = min(self.search_candidates, self.local_features_t.shape[0])
+            efS = max(efS, k)
+        else:
+            k = 1
+
         # Intitialize the library, specify the space, the type of the vector and add data points
         p = hnswlib.Index(space='l2', dim=self.local_features_s.shape[1])  # possible options are l2, cosine or ip
         p.init_index(max_elements=self.local_features_t.shape[0], ef_construction=efC, M=M)
@@ -408,16 +476,36 @@ class PointCloudTile:
 
         # Query the elements for themselves and measure recall:
         start_time = time.time()
-        labels, distances = p.knn_query(self.local_features_s.cpu().numpy(), k=1)
+        labels, distances = p.knn_query(self.local_features_s.cpu().numpy(), k=k)
         end_time = time.time()
 
+        xyz_s = np.array(self.pcd_s.points)
+        xyz_t = np.array(self.pcd_t.points)
+
+        if self.max_search_distance > 0.0:
+            match_idx, self.corr_valid, self.corr_rank = self._apply_spatial_constraint(
+                labels, xyz_s, xyz_t)
+        else:
+            match_idx = labels.reshape(-1)
+
         # Save the correspondences for subsequent steps
-        self.correspondences = np.concatenate(
-            (np.array(self.pcd_s.points), np.array(self.pcd_t.points)[labels.reshape(-1), :]), axis=1)
+        self.correspondences = np.concatenate((xyz_s, xyz_t[match_idx, :]), axis=1)
 
         if self.verbose:
             logging.info(
                 'Correspondence estimation in the feature space completed in {:.2f} s'.format(end_time - start_time))
+
+            if self.max_search_distance > 0.0:
+                n_points = self.corr_valid.shape[0]
+                n_dropped = int(np.count_nonzero(~self.corr_valid))
+                n_rescued = int(np.count_nonzero(self.corr_valid & (self.corr_rank > 0)))
+                logging.info(
+                    f'Spatial constraint ({self.max_search_distance:.2f} m, '
+                    f'{k} candidates): {n_dropped} of {n_points} points '
+                    f'({100.0 * n_dropped / max(n_points, 1):.2f} %) had no plausible candidate and '
+                    f'were dropped, {n_rescued} '
+                    f'({100.0 * n_rescued / max(n_points, 1):.2f} %) were matched to a lower-ranked '
+                    f'candidate than the feature-space nearest neighbor.')
 
         # Save the correspondences ad NX2 matrix if the interim save result mode is selected
         if self.save_interim:
@@ -426,8 +514,14 @@ class PointCloudTile:
             if not os.path.exists(save_path):
                 os.makedirs(save_path)
 
+            interim = {'corr': self.correspondences, 'feat_dist': distances}
+
+            if self.max_search_distance > 0.0:
+                interim['valid'] = self.corr_valid
+                interim['rank'] = self.corr_rank
+
             np.savez(os.path.join(save_path, 'correspondences_tile_{}.npz'.format(self.tile_id)),
-                     corr=self.correspondences)
+                     **interim)
 
         gc.collect()
 
@@ -447,6 +541,14 @@ class PointCloudTile:
             supervoxel_iter = self.supervoxels
 
         for supervoxel in supervoxel_iter:
+            # Drop the points whose correspondence violated the spatial constraint. The same size
+            # threshold as in the supervoxel extraction is applied to the remaining points.
+            if self.corr_valid is not None:
+                supervoxel = supervoxel[self.corr_valid[supervoxel]]
+
+                if supervoxel.shape[0] <= 10:
+                    continue
+
             supervoxel_data = self.correspondences[supervoxel, :]
             supervoxel_data_scaled = np.divide(supervoxel_data, np.max(np.abs(supervoxel_data)))
 

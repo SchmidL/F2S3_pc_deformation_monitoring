@@ -30,6 +30,18 @@ def main():
         help='Target spacing for for voxel grid filter. Used to make the point density more uniform (No Filter if 0)')
     parser.add_argument('--max_disp_magnitude', type=float, default=argparse.SUPPRESS,
         help='Maximum displacement magnitude, all points with higher magnitude will be filtered out (no filtering if 0)')
+    parser.add_argument('--max_search_distance', type=float, default=argparse.SUPPRESS,
+        help='Maximum plausible displacement in meters. Constrains the correspondence SEARCH: only '
+             'target points within this distance of the source point are accepted as a match, so an '
+             'ambiguous point can still be matched via a lower-ranked feature candidate. Source '
+             'points without any plausible candidate are dropped. This differs from '
+             '--max_disp_magnitude, which only deletes points from the finished result. '
+             'No spatial constraint if 0 (default).')
+    parser.add_argument('--search_candidates', type=int, default=argparse.SUPPRESS,
+        help='Number of feature-space candidates inspected per source point before giving up on it '
+             '(default 20). Only used when --max_search_distance > 0. The default follows the '
+             'ambiguity investigation, where the median number of near-tied candidates was 4 and '
+             'the measurement was right-censored at 20.')
     parser.add_argument('--neighborhood_radius', type=float, default=argparse.SUPPRESS,
         help='Neighborhood radius for local feature extraction. Overrides the default '
              'sqrt(3) * 10 * median_resolution (auto-derived if 0)')
