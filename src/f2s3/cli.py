@@ -71,6 +71,14 @@ def main():
         '--save_interim', action='store_true',
         help='Save interim results such as pointwise feature desriptors and supervoxels.')
     parser.add_argument(
+        '--save_supervoxels', action='store_true',
+        help='Save the per-point supervoxel assignment of every source tile to '
+             '<results_dir>/supervoxels/supervoxel_idx_tile_<tile>.npz (xyz + label + radius). '
+             'Unlike --save_interim this writes only the supervoxel mapping, not the (much larger) '
+             'feature descriptor and correspondence dumps. The label array is row-aligned with '
+             'tiled_data/source_tile_<tile>.ply and lets downstream tools join results back to the '
+             'supervoxel they came from.')
+    parser.add_argument(
         '--verbose', action='store_true', help='Print out more details about the process to the command line')
     parser.add_argument(
         '--filter_median_magnitude',

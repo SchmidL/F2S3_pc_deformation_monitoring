@@ -120,6 +120,7 @@ class F2S3RunSettings:
     neighborhood_radius: float = 0.0
     supervoxel_radius: float = 0.0 
     save_interim: bool = False
+    save_supervoxels: bool = False
     verbose: bool = False
     extraction_backend: str = "gpu"
     extraction_seed: int = 41
@@ -261,6 +262,7 @@ class PointCloudTile:
         self.fill_gaps_c2c = args.fill_gaps_c2c
         self.verbose = args.verbose
         self.save_interim = args.save_interim
+        self.save_supervoxels = args.save_supervoxels
         self.base_save_path = args.results_dir
         self.voxel_grid_size = args.voxel_grid_size
         self.neighborhood_radius = args.neighborhood_radius
@@ -316,6 +318,23 @@ class PointCloudTile:
                                                       str(supervoxel_save_path))
 
         supervoxel_idx = np.asarray(supervoxel_idx).reshape(-1, 1)
+
+        # Persist the per-point supervoxel assignment. The label vector is row-aligned with the
+        # source tile ply, so downstream tools can join a result row back to its supervoxel (and
+        # from there to every other point of that supervoxel) without any spatial interpolation.
+        # The xyz are stored alongside the labels as an exact join key: the tile coordinates are
+        # unique (they come out of a voxel grid) and round-trip bit-exactly through the txt output.
+        # This is deliberately separate from --save_interim, which additionally dumps the per-point
+        # feature descriptors and correspondences and is orders of magnitude larger on disk.
+        if self.save_supervoxels or self.save_interim:
+            base_folder = self.base_save_path / 'supervoxels'
+            base_folder.mkdir(exist_ok=True)
+
+            np.savez(base_folder / 'supervoxel_idx_tile_{}.npz'.format(self.tile_id),
+                     xyz=np.asarray(self.pcd_s.points),
+                     label=supervoxel_idx.reshape(-1).astype(np.int32),
+                     radius=np.float64(supervoxel_radius),
+                     voxel_grid_size=np.float64(self.voxel_grid_size))
 
         # Extract the indices of individual supervoxels
         supervoxels = np.unique(supervoxel_idx)
