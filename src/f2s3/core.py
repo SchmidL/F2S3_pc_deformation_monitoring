@@ -57,6 +57,40 @@ def _radius_from_resolution(median_resolution):
     return np.sqrt(3) * (10 * median_resolution)
 
 
+def _nn_spacing_quantile(pcd, quantile, max_query_points=200000, seed=41):
+    """Quantile of the nearest-neighbor distance ("local point spacing") of one cloud.
+
+    ``_median_nn_resolution`` returns the median spacing, which describes the typical
+    density. Choosing a voxel grid size needs the *coarse* end of the distribution
+    instead: a voxel filter of size v can only thin regions that are denser than v, so
+    only a v at or above the local spacing actually homogenises that region. Using a
+    high quantile (e.g. 90 %) therefore states "equalise the density over this fraction
+    of the surface".
+
+    Args:
+        pcd (open3d.geometry.PointCloud): cloud to measure.
+        quantile (float): percentile in [0, 100] of the nearest-neighbor distances.
+        max_query_points (int): evaluate on at most this many random query points,
+            searched against the full cloud (keeps the estimate unbiased, bounds runtime).
+        seed (int): seed of the query subsample, so the derived voxel size is reproducible.
+
+    Returns:
+        float: the requested quantile of the nearest-neighbor distance, in cloud units.
+    """
+    pts = np.asarray(pcd.points)
+    neigh = NearestNeighbors(n_neighbors=2, algorithm='kd_tree')
+    neigh.fit(pts)
+
+    if pts.shape[0] > max_query_points:
+        rng = np.random.default_rng(seed)
+        query = pts[rng.choice(pts.shape[0], max_query_points, replace=False)]
+    else:
+        query = pts
+
+    dist01, _ = neigh.kneighbors(query, return_distance=True)
+    return float(np.percentile(dist01[:, -1], quantile))
+
+
 def _median_nn_resolution(pcd_s, pcd_t, verbose=False, max_query_points=None):
     """
     Median point cloud resolution across the source and target clouds, where resolution is the
@@ -118,7 +152,10 @@ class F2S3RunSettings:
     max_search_distance: float = 0.0
     search_candidates: int = 20
     neighborhood_radius: float = 0.0
-    supervoxel_radius: float = 0.0 
+    multiscale_radii: tuple = ()
+    supervoxel_radius: float = 0.0
+    auto_voxel_grid_size: bool = False
+    auto_voxel_quantile: float = 90.0
     save_interim: bool = False
     save_supervoxels: bool = False
     verbose: bool = False
@@ -175,6 +212,24 @@ class F2S3RunSettings:
             raise ValueError("Number of search candidates needs to be a positive integer!")
         if self.neighborhood_radius < 0.0:
             raise ValueError("Neighborhood radius can't be negative!")
+
+        # Multi-scale descriptor: an explicit, ascending list of neighbourhood radii. It
+        # supersedes --neighborhood_radius for the feature extraction (that flag still sets
+        # the tile overlap fallback and is kept for the single-scale case).
+        self.multiscale_radii = tuple(float(r) for r in self.multiscale_radii)
+        if any(r <= 0.0 for r in self.multiscale_radii):
+            raise ValueError("Every multiscale radius has to be a positive number!")
+        if len(set(self.multiscale_radii)) != len(self.multiscale_radii):
+            raise ValueError("The multiscale radii have to be distinct!")
+        self.multiscale_radii = tuple(sorted(self.multiscale_radii))
+
+        if not 0.0 <= self.auto_voxel_quantile <= 100.0:
+            raise ValueError("auto_voxel_quantile has to be a percentile in [0, 100]!")
+        if self.auto_voxel_grid_size and self.start_from_tiled_data:
+            raise ValueError(
+                "--auto_voxel_grid_size derives the voxel size from the full clouds and can "
+                "therefore not be combined with --start_from_tiled_data (the tiles are already "
+                "downsampled).")
         if self.supervoxel_radius < 0.0:
             raise ValueError("Supervoxel radius can't be negative!")
         if self.extraction_backend not in {"cpu", "gpu"}:
@@ -193,16 +248,26 @@ class F2S3RunSettings:
             )
         if self.gedi_r_lrf < 0.0:
             raise ValueError("gedi_r_lrf can't be negative!")
+        if self.multiscale_radii and self.gedi_r_lrf > 0.0:
+            raise ValueError(
+                "--gedi_r_lrf pins the GeDi patch radius to a single value and would collapse "
+                "every scale of --multiscale_radii onto it. Drop one of the two.")
 
         # Prepare the logger
         logger = logging.getLogger()
         coloredlogs.install(level='INFO', logger=logger)
         log_formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(name)s - %(message)s')
 
-        args_save_path = self.results_dir / 'command_line_args.txt'
+        self.save_args()
 
-        # Save arguments to the dictionary
-        with open(args_save_path, 'w') as f:
+    def save_args(self):
+        """Write the resolved run settings to ``{results_dir}/command_line_args.txt``.
+
+        Called once from ``__post_init__`` and again after any setting that is only
+        resolvable from the data itself (currently ``--auto_voxel_grid_size``), so the
+        file always records the values the run actually used.
+        """
+        with open(self.results_dir / 'command_line_args.txt', 'w') as f:
             print(self, file=f)
 
     def __repr__(self):
@@ -266,6 +331,7 @@ class PointCloudTile:
         self.base_save_path = args.results_dir
         self.voxel_grid_size = args.voxel_grid_size
         self.neighborhood_radius = args.neighborhood_radius
+        self.multiscale_radii = args.multiscale_radii
         self.supervoxel_radius = args.supervoxel_radius
         self.batch_size = args.batch_size
 
@@ -374,11 +440,16 @@ class PointCloudTile:
             # extraction_backend (cpu/gpu) only applies to the DIP descriptor; GeDi
             # builds its own patches, so only echo the backend for DIP.
             backend_info = (f", backend: {self.extraction_backend}"
-                            if self.descriptor.name == "dip" else "")
+                            if self.descriptor.name.startswith("dip") else "")
+            if self.multiscale_radii:
+                radius_info = ('Neighborhood radii (multi-scale): '
+                               + ', '.join(f'{r:.3f}' for r in self.multiscale_radii)
+                               + f' m -> {self.descriptor.dim}-d descriptor')
+            else:
+                radius_info = f"Neighborhood radius: {neighborhood_radius:.3f}"
             logging.info(
                 f"Starting the computation of local feature descriptors. "
-                f"Descriptor: {self.descriptor.name}{backend_info}. "
-                f"Neighborhood radius: {neighborhood_radius:.3f}")
+                f"Descriptor: {self.descriptor.name}{backend_info}. {radius_info}")
 
         start_time = time.time()
 
@@ -736,6 +807,29 @@ def feature_based_deformation_analysis(args: F2S3RunSettings):
     if not args.start_from_tiled_data:
         # Resave point clouds with PCL (this makes subsequent steps much faster)
         logging.info('Starting the resave and tiling of the original point clouds.')
+        # The full clouds are needed for any setting that is derived from the data
+        # (automatic voxel size, automatic tile overlap). Read them at most once.
+        needs_full_clouds = args.auto_voxel_grid_size or (
+            args.neighborhood_radius <= 0.0 and not args.multiscale_radii)
+        pcd_s_full = pcd_t_full = None
+        if needs_full_clouds:
+            pcd_s_full = o3d.io.read_point_cloud(str(args.source_cloud))
+            pcd_t_full = o3d.io.read_point_cloud(str(args.target_cloud))
+
+        # A voxel grid filter only thins regions denser than its cell size, so to make the
+        # two epochs comparable the cell has to be at least as large as the COARSER epoch's
+        # local point spacing. Taking a high quantile (default 90 %) of the per-epoch
+        # nearest-neighbor distance and then the maximum over the two epochs gives the
+        # smallest cell size that equalises the density over that fraction of the surface.
+        if args.auto_voxel_grid_size:
+            spacing_s = _nn_spacing_quantile(pcd_s_full, args.auto_voxel_quantile)
+            spacing_t = _nn_spacing_quantile(pcd_t_full, args.auto_voxel_quantile)
+            args.voxel_grid_size = float(np.ceil(max(spacing_s, spacing_t) * 100.0) / 100.0)
+            args.save_args()
+            logging.info(
+                f'Automatic voxel grid size: p{args.auto_voxel_quantile:g} point spacing is '
+                f'{spacing_s:.4f} m (source) and {spacing_t:.4f} m (target) -> '
+                f'voxel_grid_size = {args.voxel_grid_size:.2f} m')
         # pc_tiling.resave_point_cloud(args.source_cloud,
         #                              args.target_cloud,
         #                              args.verbose)
@@ -745,23 +839,29 @@ def feature_based_deformation_analysis(args: F2S3RunSettings):
         # The overlap is therefore tied to that radius: either the user-defined value or, in the
         # automatic case, derived from a global median resolution estimated on the full clouds before
         # tiling (the per-tile resolution is not yet available at this stage).
-        if args.neighborhood_radius > 0.0:
+        if args.multiscale_radii:
+            # Every scale must see a complete neighbourhood, so the overlap follows the
+            # coarsest scale.
+            tile_overlap = max(args.multiscale_radii)
+            if args.verbose:
+                logging.info(
+                    f'Using the coarsest multi-scale radius as tile overlap: {tile_overlap:.3f} m')
+        elif args.neighborhood_radius > 0.0:
             tile_overlap = args.neighborhood_radius
             if args.verbose:
                 logging.info(
                     f'Using the user-defined neighborhood radius as tile overlap: {tile_overlap:.3f} m')
         else:
-            pcd_s_full = o3d.io.read_point_cloud(str(args.source_cloud))
-            pcd_t_full = o3d.io.read_point_cloud(str(args.target_cloud))
             global_resolution = _median_nn_resolution(
                 pcd_s_full, pcd_t_full, args.verbose, max_query_points=100000)
             tile_overlap = _radius_from_resolution(global_resolution)
-            del pcd_s_full, pcd_t_full
-            gc.collect()
             if args.verbose:
                 logging.info(
                     f'Derived tile overlap from global median resolution ({global_resolution:.4f} m): '
                     f'{tile_overlap:.3f} m')
+
+        del pcd_s_full, pcd_t_full
+        gc.collect()
 
         # Tile the point cloud into smaller tiles that can be processed on a standalone computer
         pc_tiling.tile_point_clouds(str(args.source_cloud),

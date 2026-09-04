@@ -45,10 +45,32 @@ def main():
     parser.add_argument('--neighborhood_radius', type=float, default=argparse.SUPPRESS,
         help='Neighborhood radius for local feature extraction. Overrides the default '
              'sqrt(3) * 10 * median_resolution (auto-derived if 0)')
+    parser.add_argument('--multiscale_radii', type=float, nargs='+', default=argparse.SUPPRESS,
+        help='Two or more neighborhood radii in meters, e.g. "--multiscale_radii 2 6 12". The '
+             'descriptor is computed once per radius and the per-scale vectors are L2-normalised '
+             'and concatenated (scaled by 1/sqrt(S)), so the correspondence search sees a '
+             'S*dim-dimensional descriptor in which every scale weighs the same. Coarse scales add '
+             'context that breaks ties the fine scale cannot break on self-similar terrain. '
+             'Supersedes --neighborhood_radius for the feature extraction; the tile overlap follows '
+             'the coarsest radius. Cost is roughly linear in the number of scales. LIMITATION: each '
+             'scale is described from a fixed-size subsample of its neighborhood (256 points for '
+             'DIP, 4000 LRF points for GeDi), so a coarse scale is a sparser sampling of a larger '
+             'area, not a richer description of it.')
     parser.add_argument('--supervoxel_radius', type=float, default=argparse.SUPPRESS,
         help='Fixed supervoxel radius in meters (unit of local-consistency filtering). '
              'Overrides the default max(sqrt(3)*10*median_resolution, voxel_grid_size). '
              'Derived automatically if 0.')
+    parser.add_argument('--auto_voxel_grid_size', action='store_true', default=argparse.SUPPRESS,
+        help='Derive --voxel_grid_size from the data instead of setting it by hand. The cell size '
+             'is the maximum over the two epochs of the --auto_voxel_quantile percentile of the '
+             'nearest-neighbor point spacing, rounded up to the centimeter. Rationale: a voxel '
+             'filter can only thin regions that are denser than its cell, so the cell has to be at '
+             'least as large as the coarser epoch spacing for the two epochs to end up with a '
+             'comparable density. Cannot be combined with --start_from_tiled_data.')
+    parser.add_argument('--auto_voxel_quantile', type=float, default=argparse.SUPPRESS,
+        help='Percentile of the nearest-neighbor spacing used by --auto_voxel_grid_size '
+             '(default 90). 50 gives the median spacing and equalises only half of the surface; '
+             '90 equalises the density over 90 %% of it at the price of a coarser cloud.')
     parser.add_argument('--extraction_backend', type=str, default=argparse.SUPPRESS,
         help='Extraction backend for local feature patch construction: "gpu" (default) '
              'or "cpu" (the original DataLoader/CPU-extract path). '

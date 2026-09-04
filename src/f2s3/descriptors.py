@@ -9,10 +9,17 @@ runtime via ``--descriptor``:
 - ``GediDescriptor`` wraps the vendored GeDi network (32-d). Its heavy native
   dependency (``pointnet2_ops``) is imported lazily, so a DIP-only run never needs it.
 
+- ``MultiScaleDescriptor`` wraps either of the above and evaluates it at several
+  neighbourhood radii, concatenating the per-scale descriptors into one long vector
+  (selected via ``--multiscale_radii``).
+
 Both expose ``extract_features(query_pcd, search_pcd, neighborhood_radius) -> Tensor``
 returning an ``[N, dim]`` tensor (DIP on CUDA, GeDi on CPU; callers move as needed) and
 a ``dim`` attribute used to size the correspondence index.
 """
+import logging
+import math
+import time
 from importlib import resources
 from pathlib import Path
 
@@ -180,6 +187,74 @@ class GediDescriptor:
         return torch.from_numpy(desc).float()
 
 
+class MultiScaleDescriptor:
+    """A base descriptor evaluated at several radii, concatenated into one vector.
+
+    Motivation. A single-scale local descriptor is only as distinctive as the terrain
+    inside its one neighbourhood radius. On self-similar terrain (uniform debris /
+    moraine surfaces) many source points then carry near-identical descriptors, and the
+    1-NN feature match is effectively a coin toss between spatially scattered candidates
+    - the ambiguity mechanism documented in ``investigate/FINDINGS.md``. Adding coarser
+    radii injects context that is *not* self-similar at the fine scale (slope break,
+    ridge, gully) and so breaks ties the fine scale cannot break.
+
+    Construction. For radii ``r_1 < ... < r_S`` the per-scale descriptors ``f_s`` are
+    L2-normalised (DIP and GeDi already emit unit vectors; this is insurance against
+    degenerate rows) and stacked scaled by ``1/sqrt(S)``::
+
+        f = [f_1, ..., f_S] / sqrt(S)
+
+    The result is again a unit vector, and the squared L2 distance the HNSW index
+    minimises becomes the *mean* squared per-scale distance::
+
+        ||f - g||^2 = (1/S) * sum_s ||f_s - g_s||^2
+
+    so every scale contributes equally and no scale can dominate by sheer magnitude.
+    The output dimension is ``S * base.dim`` (e.g. 3 x 32 = 96 for GeDi at 3 scales).
+
+    Limitation (documented, not solved). Each scale is described from a fixed-size
+    subsample of its neighbourhood - 256 points for DIP, 4000 LRF points for GeDi -
+    regardless of radius. A coarse scale therefore sees the same number of points
+    spread over a much larger area, i.e. it is a *sparser* sampling of the surface, not
+    a denser description of it. The coarse channels consequently encode low-frequency
+    shape, and fine detail at large radii is not recoverable with these descriptors.
+    A descriptor that consumes the full neighbourhood would be needed to remove this.
+
+    Args:
+        base: a descriptor exposing ``extract_features`` and ``dim``.
+        radii (sequence of float): neighbourhood radii in metres, ascending.
+        verbose (bool): log per-scale timing.
+    """
+
+    def __init__(self, base, radii, verbose=False):
+        self.base = base
+        self.radii = tuple(sorted(float(r) for r in radii))
+        self.dim = base.dim * len(self.radii)
+        self.name = f"{base.name}-ms{len(self.radii)}"
+        self.verbose = verbose
+
+    def extract_features(self, query_pcd, search_pcd, neighborhood_radius):
+        """Extract and concatenate the per-scale descriptors.
+
+        ``neighborhood_radius`` is ignored: the explicit ``radii`` define the scales.
+        """
+        parts = []
+        weight = 1.0 / math.sqrt(len(self.radii))
+
+        for radius in self.radii:
+            start_time = time.time()
+            feat = self.base.extract_features(query_pcd, search_pcd, radius)
+            feat = torch.nn.functional.normalize(feat.float(), p=2, dim=1)
+            parts.append(feat * weight)
+
+            torch.cuda.empty_cache()
+            if self.verbose:
+                logging.info(f'  scale r={radius:.2f} m: {feat.shape[0]}x{feat.shape[1]} '
+                             f'descriptors in {time.time() - start_time:.2f} s')
+
+        return torch.cat(parts, dim=1)
+
+
 def build_descriptor(args):
     """Construct the descriptor backend selected by ``args.descriptor``.
 
@@ -187,8 +262,20 @@ def build_descriptor(args):
         args (F2S3RunSettings): resolved run settings.
 
     Returns:
-        A descriptor exposing ``extract_features(...)`` and ``dim``.
+        A descriptor exposing ``extract_features(...)`` and ``dim``. When
+        ``args.multiscale_radii`` is set the backend is wrapped in a
+        :class:`MultiScaleDescriptor`.
     """
+    base = _build_base_descriptor(args)
+
+    if args.multiscale_radii:
+        return MultiScaleDescriptor(base, args.multiscale_radii, verbose=args.verbose)
+
+    return base
+
+
+def _build_base_descriptor(args):
+    """Construct the single-scale descriptor backend selected by ``args.descriptor``."""
     if args.descriptor == "gedi":
         with resources.path('f2s3.pretrained_models.gedi', 'chkpt.tar') as ckpt:
             ckpt = Path(ckpt)
