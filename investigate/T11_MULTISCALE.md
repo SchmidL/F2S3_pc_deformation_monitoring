@@ -241,3 +241,79 @@ same order as the baseline's 8.8 k. Multi-scale descriptors reduce the ambiguity
 feeds the blobs; they do not remove the blobs. The ambiguity-rejection rules from T6 and
 the spatial constraint from T9/T10 remain the tools for that, and should now be re-tuned
 on top of the multi-scale descriptor rather than the single-scale one.
+
+---
+
+## 6. T11b — multi-scale combined with `--max_search_distance 40`
+
+`run_multiscale_maxdist_TCH.sh`, scored by `investigate/t11b_maxdist.py`. Both
+constrained runs reuse the tiles of their unconstrained counterpart
+(`--start_from_tiled_data`), so the only difference is the constraint. Voxel 0.32 m
+throughout, `--search_candidates 20`.
+
+| metric | single r6 | single r6 + d40 | **ms 2/6/12** | ms 2/6/12 + d40 |
+|---|---|---|---|---|
+| survivors | 143,913 | 92,229 | **225,648** | 52,156 |
+| of source [%] | 21.4 | 13.7 | **33.5** | 7.7 |
+| median \|v\| [m] | 7.69 | 7.72 | 7.33 | 7.53 |
+| ≥ 40 m [%] | 4.39 | 0.00 *(circular)* | 3.45 | 0.00 *(circular)* |
+| coherence residual [m] | 0.26 | 0.23 | 0.29 | 0.23 |
+| coherent < 2 m [%] | 96.7 | 97.9 | **97.8** | 96.9 |
+| **coherent points** | 139,189 | 90,261 | **220,717** | 50,515 |
+
+At the constraint stage itself:
+
+| | dropped (no candidate ≤ 40 m) | re-matched to a lower-ranked candidate |
+|---|---|---|
+| single r6 | 22.20 % | 45.04 % |
+| ms 2/6/12 | **16.32 %** | 42.56 % |
+
+### 6.1 The `≥ 40 m` column is now circular
+
+`--max_search_distance 40` rejects every candidate further than 40 m away, and the
+outlier proxy labels a vector an outlier at ≥ 40 m. The 0.00 % is therefore a
+restatement of the setting, not a result. Any comparison involving a constrained run
+must be read off the coherence columns, which do not use the threshold.
+
+### 6.2 The constraint helps the matcher and hurts the field
+
+The descriptor comparison behaves exactly as §5 predicts: with multi-scale descriptors
+**fewer** points fail to find any plausible partner (16.3 % vs 22.2 % dropped). The
+multi-scale 1-NN is more often already spatially sensible.
+
+The finished field nevertheless collapses: 225,648 → 52,156 survivors, a 77 % loss,
+with coherence *falling* slightly (97.8 % → 96.9 %). The count of vectors that are both
+kept and locally consistent goes from 220,717 to 50,515 — the worst of the four cells.
+For the single-scale descriptor the same constraint is a milder version of the same
+trade: −36 % survivors for +1.2 points of coherence.
+
+The mechanism is visible in the second column of the constraint table. The constraint
+re-matches ~43 % of all points to a lower-ranked feature candidate. That candidate is
+spatially plausible *by construction* but weaker in feature space, and the supervoxel
+rigid-consistency filter then rejects it. So the constraint converts obviously-wrong far
+matches into plausible-looking near matches, and the filter — which was already the
+component doing the real work — throws those away instead. Multi-scale loses more in
+absolute terms simply because it had more good top-1 matches to overwrite.
+
+This is consistent with the T10 sweep on the single-scale run, where the count of
+coherent vectors peaked at R ≈ 18–22 m and was already declining by R = 40 m.
+
+### 6.3 Recommendation
+
+**Do not use 40 m.** On this scene the best configuration remains
+`--multiscale_radii 2 6 12 --auto_voxel_grid_size` with **no** spatial constraint:
+220,717 coherent points against 90,261 (single + d40) and 50,515 (multi + d40).
+
+If a constraint is wanted, it has to be tight enough to reject only genuine blunders —
+T9 calibrated 21 m on the single-scale run — and it has to be re-calibrated on the
+multi-scale descriptor, because the anchor rule it is built on (`r10 < 0.7`) is not
+valid at D = 96 (§5.2). The cheap way to do that is to replay the radius sweep offline
+from the saved `ms2_6_12_vauto` features, as T10 does, rather than re-running F2S3 per
+radius.
+
+### 6.4 Runtime note
+
+Multi-scale feature extraction is unstable at the 12 m scale: the same configuration on
+the same tiles took 5 min in one run and 33 min in another, with identical adaptive
+chunk sizes. The neighbour search — not the network — is the variable part. Worth
+profiling before the multi-scale path is used on a full-size dataset.
